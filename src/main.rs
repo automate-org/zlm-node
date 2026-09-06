@@ -40,6 +40,10 @@ struct Config {
     #[serde(default = "default_report_interval")]
     report_interval_secs: u64,
 
+    /// IP 刷新间隔（秒），默认 5 秒
+    #[serde(default = "default_ip_refresh_interval")]
+    ip_refresh_interval_secs: u64,
+
     /// 静态资源基地址（若不设置则与 http_fmp4_base 相同）
     static_base: Option<String>,
 
@@ -75,6 +79,9 @@ fn default_zlm_http_port() -> u16 {
 }
 fn default_report_interval() -> u64 {
     30
+}
+fn default_ip_refresh_interval() -> u64 {
+    5
 }
 fn default_enable_rtc() -> bool {
     true
@@ -285,57 +292,76 @@ async fn report_status(
 
 // ---------- 持续运行主循环 ----------
 async fn run_loop(client: &Client, config: &Config) {
-    let interval = Duration::from_secs(config.report_interval_secs);
-    info!(
-        "Starting ZLM node reporter (interval={}s, TLS insecure={}, rtc.externIP update={})",
-        config.report_interval_secs,
-        config.tls_accept_invalid_certs,
-        config.enable_rtc_extern_ip_update
-    );
+    // 启动时获取一次版本，并缓存（后续不再更新）
+    let cached_version = get_zlm_version(client, config).await;
+    info!("ZLM version (cached): {}", cached_version);
 
-    let mut last_ip: Option<String> = None; // 用于上报缓存
-    let mut last_extern_ip: Option<String> = None; // 用于 rtc.externIP 变化检测
-    let mut url_index: usize = 0;
+    let report_interval = Duration::from_secs(config.report_interval_secs);
+    let ip_refresh_interval = Duration::from_secs(config.ip_refresh_interval_secs);
+
+    let mut report_tick = tokio::time::interval(report_interval);
+    let mut ip_refresh_tick = tokio::time::interval(ip_refresh_interval);
+
+    let mut cached_ip: Option<String> = None;
+    let mut url_index = 0;
 
     loop {
-        match get_public_ip(client, config, &mut url_index).await {
-            Ok(ip) => {
-                // 更新上报缓存
-                last_ip = Some(ip.clone());
-                let version = get_zlm_version(client, config).await;
-                info!("Public IP: {}, Version: {}", ip, version);
-
-                // 若启用 rtc.externIP 更新且 IP 与上次设置的不同，则调用 ZLM API
-                if config.enable_rtc_extern_ip_update {
-                    if last_extern_ip.as_ref() != Some(&ip) {
-                        update_extern_ip(client, config, &ip).await;
-                        last_extern_ip = Some(ip.clone());
+        tokio::select! {
+            _ = report_tick.tick() => {
+                // 周期上报
+                if let Some(ip) = &cached_ip {
+                    if let Err(e) = report_status(client, config, ip, &cached_version).await {
+                        warn!("Periodic report failed: {:?}", e);
+                    } else {
+                        info!("Periodic report sent.");
                     }
-                }
-
-                if let Err(e) = report_status(client, config, &ip, &version).await {
-                    warn!("Report failed: {:?}", e);
                 } else {
-                    info!("Report sent successfully.");
+                    // 尚无 IP，尝试立即获取并上报
+                    match get_public_ip(client, config, &mut url_index).await {
+                        Ok(ip) => {
+                            cached_ip = Some(ip.clone());
+                            if let Err(e) = report_status(client, config, &ip, &cached_version).await {
+                                warn!("Initial report failed: {:?}", e);
+                            } else {
+                                info!("Initial report sent.");
+                            }
+                        }
+                        Err(e) => warn!("Failed to get IP for initial report: {:?}", e),
+                    }
                 }
             }
-            Err(e) => {
-                warn!("Failed to get IP: {:?}", e);
-                if let Some(ref ip) = last_ip {
-                    warn!("Using last known IP: {}", ip);
-                    let version = get_zlm_version(client, config).await;
-                    if let Err(e) = report_status(client, config, ip, &version).await {
-                        warn!("Report failed (with cached IP): {:?}", e);
-                    } else {
-                        info!("Report sent (using cached IP).");
+            _ = ip_refresh_tick.tick() => {
+                // 刷新 IP，变化时立即上报
+                match get_public_ip(client, config, &mut url_index).await {
+                    Ok(ip) => {
+                        if cached_ip.as_ref() != Some(&ip) {
+                            info!("Public IP changed from {:?} to {}", cached_ip, ip);
+                            cached_ip = Some(ip.clone());
+
+                            if config.enable_rtc_extern_ip_update {
+                                update_extern_ip(client, config, &ip).await;
+                            }
+
+                            // IP 变化时立即上报，但版本仍使用启动时缓存的版本
+                            if let Err(e) = report_status(client, config, &ip, &cached_version).await {
+                                warn!("Immediate report after IP change failed: {:?}", e);
+                            } else {
+                                info!("Immediate report after IP change sent.");
+                            }
+                        } else {
+                            cached_ip = Some(ip);
+                        }
                     }
-                } else {
-                    warn!("No cached IP, skipping this cycle.");
+                    Err(e) => {
+                        warn!("Failed to refresh IP: {:?}", e);
+                    }
                 }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received shutdown signal, exiting.");
+                break;
             }
         }
-
-        tokio::time::sleep(interval).await;
     }
 }
 

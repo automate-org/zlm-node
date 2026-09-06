@@ -42,21 +42,22 @@ cargo build --release
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `NODE_TOKEN` | 空 | 节点鉴权令牌（上报时通过 `X-Node-Token` 头发送 blake3 哈希） |
-| `SERVER_ID` | `1` | 节点 ID，用于标识当前 ZLM 节点 |
-| `API_BASE` | `http://127.0.0.1:9080` | ZLM API 基础地址 |
-| `SECRET` | `935v73f7-bb6b-4889-a715-d9eb2d1936aa` | ZLM API 密钥 |
-| `MGR_URL` | `http://127.0.0.1:3002/api/zlm/report-status` | 管理端状态上报接口 |
-| `CUSTOM_IP` | 无 | 手动指定公网 IP（优先级最高） |
-| `INTERFACE` | 无 | 指定网卡名称，从该网卡获取 IPv4 地址 |
-| `IP_ECHO_API` | 无 | 自定义 IP 获取服务地址，例如 `http://your-cloud-server:8080`，优先级高于内置公共 API |
-| `ZLM_HTTP_PORT` | `9080` | ZLM HTTP 端口，用于拼接 `http_fmp4_base` |
-| `USE_HTTPS` | `false` | 是否使用 HTTPS 协议拼接 `http_fmp4_base` |
-| `STATIC_BASE` | 无 | 静态资源基地址，若不设置则与 `http_fmp4_base` 相同 |
-| `HTTP_FMP4_BASE` | 无 | 手动指定 `http_fmp4_base`，覆盖自动生成 |
-| `REPORT_INTERVAL_SECS` | `30` | 上报间隔（秒） |
-| `TLS_ACCEPT_INVALID_CERTS` | `false` | 是否接受无效 TLS 证书（自签名场景） |
-| `ENABLE_RTC_EXTERN_IP_UPDATE` | `true` | 是否自动更新 ZLM 的 `rtc.externIP` |
+| NODE_TOKEN | 空 | 节点鉴权令牌（上报时通过 X-Node-Token 头发送 blake3 哈希） |
+| SERVER_ID | 1 | 节点 ID，用于标识当前 ZLM 节点 |
+| API_BASE | http://127.0.0.1:9080 | ZLM API 基础地址 |
+| SECRET | 935v73f7-bb6b-4889-a715-d9eb2d1936aa | ZLM API 密钥 |
+| MGR_URL | http://127.0.0.1:3002/api/zlm/report-status | 管理端状态上报接口 |
+| CUSTOM_IP | 无 | 手动指定公网 IP（优先级最高） |
+| INTERFACE | 无 | 指定网卡名称，从该网卡获取 IPv4 地址 |
+| IP_ECHO_API | 无 | 自定义 IP 获取服务地址，例如 http://your-cloud-server:8080，优先级高于内置公共 API |
+| ZLM_HTTP_PORT | 9080 | ZLM HTTP 端口，用于拼接 http_fmp4_base |
+| USE_HTTPS | false | 是否使用 HTTPS 协议拼接 http_fmp4_base |
+| STATIC_BASE | 无 | 静态资源基地址，若不设置则与 http_fmp4_base 相同 |
+| HTTP_FMP4_BASE | 无 | 手动指定 http_fmp4_base，覆盖自动生成 |
+| REPORT_INTERVAL_SECS | 30 | 上报间隔（秒） |
+| IP_REFRESH_INTERVAL_SECS | 5 | IP刷新间隔（秒） |
+| TLS_ACCEPT_INVALID_CERTS | false | 是否接受无效 TLS 证书（自签名场景） |
+| ENABLE_RTC_EXTERN_IP_UPDATE | true | 是否自动更新 ZLM 的 rtc.externIP |
 
 > **IP 获取优先级**：  
 > `CUSTOM_IP` > `INTERFACE` > `IP_ECHO_API` > 内置公共 API（`ip.3322.net`、`ip.automate.org.cn`）
@@ -79,6 +80,7 @@ export SECRET=your_zlm_secret
 export MGR_URL=http://your-gbhub-domain/api/zlm/report-status
 export IP_ECHO_API=http://your-cloud-server:8080
 export REPORT_INTERVAL_SECS=30
+export IP_REFRESH_INTERVAL_SECS=5
 export ENABLE_RTC_EXTERN_IP_UPDATE=true
 ```
 
