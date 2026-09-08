@@ -113,6 +113,36 @@ fn get_interface_ip(iface: &str) -> Result<String> {
     anyhow::bail!("Interface '{}' not found or has no IPv4 address", iface)
 }
 
+/// 将配置字符串中的 {ip} 和 {interface:网卡名} 替换为实际 IP
+fn resolve_placeholder(base: &str, public_ip: &str) -> String {
+    // 先替换 {ip}
+    let mut result = base.replace("{ip}", public_ip);
+
+    // 替换 {interface:NAME}
+    let mut search_from = 0;
+    while let Some(start_rel) = result[search_from..].find("{interface:") {
+        let start = search_from + start_rel;
+        if let Some(end_rel) = result[start..].find('}') {
+            let end = start + end_rel;
+            let iface = result[start + "{interface:".len()..end].to_string();
+            let replacement = match get_interface_ip(&iface) {
+                Ok(ip) => ip,
+                Err(e) => {
+                    warn!("Failed to get IP for interface '{}': {:?}", iface, e);
+                    // 保留原文，但设置 search_from 跳过此占位符，避免死循环
+                    format!("{{interface:{}}}", iface)
+                }
+            };
+            result.replace_range(start..=end, &replacement);
+            search_from = start + replacement.len(); // 继续从此处之后查找
+        } else {
+            break; // 没有闭合括号，停止解析
+        }
+    }
+
+    result
+}
+
 // ---------- 获取公网 IP（按优先级）----------
 async fn get_public_ip(client: &Client, config: &Config, url_index: &mut usize) -> Result<String> {
     // 1. 手动指定 IP
@@ -249,19 +279,21 @@ async fn report_status(
     public_ip: &str,
     version: &str,
 ) -> Result<()> {
-    // 1. 确定 http_fmp4_base（优先使用环境变量）
-    let http_fmp4_base = if let Some(custom) = &config.http_fmp4_base {
+    // 1. 确定 http_fmp4_base（支持占位符）
+    let http_fmp4_base_raw = if let Some(custom) = &config.http_fmp4_base {
         custom.clone()
     } else {
         let proto = if config.use_https { "https" } else { "http" };
         format!("{}://{}:{}/", proto, public_ip, config.zlm_http_port)
     };
+    let http_fmp4_base = resolve_placeholder(&http_fmp4_base_raw, public_ip);
 
-    // 2. 确定 static_base（若未设置则回退到 http_fmp4_base）
-    let static_base = config
+    // 2. 确定 static_base（支持占位符）
+    let static_base_raw = config
         .static_base
         .clone()
         .unwrap_or_else(|| http_fmp4_base.clone());
+    let static_base = resolve_placeholder(&static_base_raw, public_ip);
 
     let hashed_token = hash_token(&config.node_token);
 

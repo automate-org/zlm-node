@@ -18,6 +18,10 @@
 ---
 
 ## 📦 快速开始
+### cargo 安装
+```bash
+cargo install zlm-node
+```
 
 ### 编译
 
@@ -53,7 +57,7 @@ cargo build --release
 | ZLM_HTTP_PORT | 9080 | ZLM HTTP 端口，用于拼接 http_fmp4_base |
 | USE_HTTPS | false | 是否使用 HTTPS 协议拼接 http_fmp4_base |
 | STATIC_BASE | 无 | 静态资源基地址，若不设置则与 http_fmp4_base 相同 |
-| HTTP_FMP4_BASE | 无 | 手动指定 http_fmp4_base，覆盖自动生成 |
+| HTTP_FMP4_BASE | 无 | HTTP-FMP4 播放基地址，支持占位符；不设置则自动生成 |
 | REPORT_INTERVAL_SECS | 30 | 上报间隔（秒） |
 | IP_REFRESH_INTERVAL_SECS | 5 | IP刷新间隔（秒） |
 | TLS_ACCEPT_INVALID_CERTS | false | 是否接受无效 TLS 证书（自签名场景） |
@@ -61,7 +65,24 @@ cargo build --release
 
 > **IP 获取优先级**：  
 > `CUSTOM_IP` > `INTERFACE` > `IP_ECHO_API` > 内置公共 API（`ip.3322.net`、`ip.automate.org.cn`）
+---
 
+## 占位符支持
+
+在 `HTTP_FMP4_BASE` 和 `STATIC_BASE` 中可使用以下占位符，程序会在每次上报时替换为实际 IP：
+
+- `{ip}`：替换为当前上报所用的公网 IP（即 `public_ip`）。
+- `{interface:网卡名}`：替换为指定网卡的第一个 IPv4 地址，例如 `{interface:eth1}`。
+
+**示例**：
+
+```bash
+# 播放地址使用 eth1 网卡的 IP，而上报 IP 使用公网 IP
+export HTTP_FMP4_BASE="http://{interface:eth1}:9080/"
+
+# 播放地址使用公网 IP，但指定 HTTPS 和自定义路径
+export HTTP_FMP4_BASE="https://{ip}:9443/live/"
+```
 ---
 
 ## 🔧 配置示例
