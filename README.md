@@ -122,12 +122,12 @@ export TUNNEL_CA_CERT=/etc/zlm-node/ca.pem
 
 编辑 ZLMediaKit 的 `config.ini`，将 `[hook]` 部分的所有 URL 改为本地隧道地址：
 ```ini
-  [hook]
-  on_play=http://127.0.0.1:18080/hook/on_play
-  on_publish=http://127.0.0.1:18080/hook/on_publish
-  on_stream_changed=http://127.0.0.1:18080/hook/on_stream_changed
-  on_rtsp_realm=http://127.0.0.1:18080/hook/on_rtsp_realm
-  # 其他 hook 同样修改
+[hook]
+on_play=http://127.0.0.1:18080/hook/on_play
+on_publish=http://127.0.0.1:18080/hook/on_publish
+on_stream_changed=http://127.0.0.1:18080/hook/on_stream_changed
+on_rtsp_realm=http://127.0.0.1:18080/hook/on_rtsp_realm
+# 其他 hook 同样修改
 ```
 重启 ZLMediaKit 使配置生效。之后所有 Hook 请求都会通过 `zlm-node` 加密转发到远程服务。
 ---
