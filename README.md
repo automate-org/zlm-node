@@ -179,10 +179,10 @@ export INTERFACE=eth0
 ## 🧪 验证
 
 1. 确认 zlm-node 日志输出类似：
-   ```bash
-   Public IP: 123.45.67.89, Version: master(abc123)
-   Report sent successfully.
-   ```
+```bash
+Public IP: 123.45.67.89, Version: master(abc123)
+Report sent successfully.
+```
 2. 检查管理端是否收到节点状态更新。
 3. 如果启用了 `ENABLE_RTC_EXTERN_IP_UPDATE`，登录 ZLM 管理界面查看 `rtc.externIP` 是否已同步为公网 IP。
 
