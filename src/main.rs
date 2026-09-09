@@ -137,7 +137,7 @@ fn default_enable_rtc() -> bool {
     true
 }
 fn default_tunnel_local_addr() -> String {
-    "127.0.0.1:18080".to_string()
+    "127.0.0.1:3003".to_string()
 }
 fn default_tunnel_server_name() -> String {
     "tunnel.example.com".to_string()
@@ -532,7 +532,9 @@ async fn main() -> Result<()> {
         let server_name = ServerName::try_from(config.tunnel_server_name.clone())
             .map_err(|e| anyhow!("Invalid tunnel server name: {}", e))?;
         let connector = build_tls_connector(&config)?;
-
+        let tunnel_auth_token = std::env::var("TUNNEL_AUTH_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty());
         let tunnel_cfg = Arc::new(tunnel::TunnelConfig {
             local_addr: config.tunnel_local_addr.clone(),
             remote_addr: config.tunnel_remote_addr.clone(),
@@ -545,6 +547,7 @@ async fn main() -> Result<()> {
             retry_delay: Duration::from_secs(config.tunnel_retry_delay_secs),
             max_retry_delay: Duration::from_secs(config.tunnel_max_retry_delay_secs),
             buffer_size: config.tunnel_buffer_size,
+            auth_token: tunnel_auth_token,
         });
 
         let shutdown_clone = shutdown.clone();

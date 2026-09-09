@@ -92,20 +92,21 @@ export HTTP_FMP4_BASE="https://{ip}:9443/live/"
 
 | 环境变量 | 类型 | 默认值 | 说明 |
 |----------|------|--------|------|
-| `TUNNEL_ENABLE` | bool | `false` | 是否启用 TLS 隧道 |
-| `TUNNEL_LOCAL_ADDR` | string | `127.0.0.1:18080` | 本地隧道监听地址 |
-| `TUNNEL_REMOTE_ADDR` | string | 空 | 远程 TLS 服务地址（必须设置） |
-| `TUNNEL_SERVER_NAME` | string | `tunnel.example.com` | TLS 服务器名称（域名） |
-| `TUNNEL_CA_CERT` | string (可选) | 无 | 自定义 CA 证书路径 |
-| `TUNNEL_CLIENT_CERT` | string (可选) | 无 | 客户端证书路径（mTLS） |
-| `TUNNEL_CLIENT_KEY` | string (可选) | 无 | 客户端私钥路径（mTLS） |
-| `TUNNEL_MAX_CONNECTIONS` | usize | `100` | 最大并发连接数 |
-| `TUNNEL_IDLE_TIMEOUT_SECS` | u64 | `300` | 连接空闲超时（秒），0 表示禁用 |
-| `TUNNEL_CONNECT_TIMEOUT_SECS` | u64 | `10` | 远程连接超时（秒） |
-| `TUNNEL_RETRY_DELAY_SECS` | u64 | `2` | 连接失败后初始重试延迟（秒） |
-| `TUNNEL_MAX_RETRY_DELAY_SECS` | u64 | `30` | 指数退避最大延迟（秒） |
-| `TUNNEL_BUFFER_SIZE` | usize | `65536` | 数据传输缓冲区大小（字节） |
-| `TUNNEL_DISABLE_TLS_RESUMPTION` | bool | `false` | 是否禁用 TLS 会话恢复 |
+| TUNNEL_ENABLE | bool | false | 是否启用 TLS 隧道 |
+| TUNNEL_LOCAL_ADDR | string | 127.0.0.1:18080 | 本地隧道监听地址 |
+| TUNNEL_REMOTE_ADDR | string | 空 | 远程 TLS 服务地址（必须设置） |
+| TUNNEL_SERVER_NAME | string | tunnel.example.com | TLS 服务器名称（域名） |
+| TUNNEL_CA_CERT | string (可选) | 无 | 自定义 CA 证书路径 |
+| TUNNEL_CLIENT_CERT | string (可选) | 无 | 客户端证书路径（mTLS） |
+| TUNNEL_CLIENT_KEY | string (可选) | 无 | 客户端私钥路径（mTLS） |
+| TUNNEL_MAX_CONNECTIONS | usize | 100 | 最大并发连接数 |
+| TUNNEL_IDLE_TIMEOUT_SECS | u64 | 300 | 连接空闲超时（秒），0 表示禁用 |
+| TUNNEL_CONNECT_TIMEOUT_SECS | u64 | 10 | 远程连接超时（秒） |
+| TUNNEL_RETRY_DELAY_SECS | u64 | 2 | 连接失败后初始重试延迟（秒） |
+| TUNNEL_MAX_RETRY_DELAY_SECS | u64 | 30 | 指数退避最大延迟（秒） |
+| TUNNEL_BUFFER_SIZE | usize | 65536 | 数据传输缓冲区大小（字节） |
+| TUNNEL_DISABLE_TLS_RESUMPTION | bool | false | 是否禁用 TLS 会话恢复 |
+| TUNNEL_AUTH_TOKEN | 空 | 否 | 简单密码认证 token，客户端与服务端一致；为空则跳过认证。 |
 
 ### 启用隧道
 
@@ -116,6 +117,7 @@ export TUNNEL_LOCAL_ADDR=127.0.0.1:18080
 export TUNNEL_REMOTE_ADDR=tunnel.example.com:443
 export TUNNEL_SERVER_NAME=tunnel.example.com
 export TUNNEL_CA_CERT=/etc/zlm-node/ca.pem
+export TUNNEL_AUTH_TOKEN=my-secret-token
 ./zlm-node
 ```
 ### 修改 ZLMediaKit 配置

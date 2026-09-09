@@ -3,7 +3,7 @@ use log::{debug, info, warn};
 use rustls::pki_types::ServerName;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::{Instant, sleep, timeout};
@@ -20,6 +20,7 @@ pub struct TunnelConfig {
     pub retry_delay: Duration,
     pub max_retry_delay: Duration,
     pub buffer_size: usize,
+    pub auth_token: Option<String>, // 新增：Token 认证
 }
 
 pub async fn run_tls_tunnel(cfg: Arc<TunnelConfig>, shutdown: Arc<Notify>) -> Result<()> {
@@ -136,8 +137,17 @@ async fn connect_remote_forever(
         )
         .await
         {
-            Ok(Ok(tls)) => {
+            Ok(Ok(mut tls)) => {
                 info!("Remote connection established after {} attempt(s)", attempt);
+
+                // 发送认证 token（如果配置）
+                if let Some(token) = &cfg.auth_token {
+                    tls.write_all(token.as_bytes()).await?;
+                    tls.write_all(b"\n").await?;
+                    // 可选：等待服务端确认，这里简单认为发送成功即可
+                    info!("Auth token sent");
+                }
+
                 return Ok((tls, Some(early_data)));
             }
             Ok(Err(e)) => {
@@ -206,10 +216,10 @@ async fn copy_bidirectional_with_idle<R1, W1, R2, W2>(
     buffer_size: usize,
 ) -> Result<u64>
 where
-    R1: AsyncReadExt + Unpin,
-    W1: AsyncWriteExt + Unpin,
-    R2: AsyncReadExt + Unpin,
-    W2: AsyncWriteExt + Unpin,
+    R1: tokio::io::AsyncReadExt + Unpin,
+    W1: tokio::io::AsyncWriteExt + Unpin,
+    R2: tokio::io::AsyncReadExt + Unpin,
+    W2: tokio::io::AsyncWriteExt + Unpin,
 {
     let mut total = 0u64;
     let mut buf1 = vec![0u8; buffer_size];
