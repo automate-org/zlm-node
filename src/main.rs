@@ -1,8 +1,14 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use log::{info, warn};
 use reqwest::Client;
+use rustls::pki_types::ServerName;
 use serde::Deserialize;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
+use tokio_rustls::TlsConnector;
+
+mod tunnel;
 
 // ---------- 外网 API 列表 ----------
 const API_URLS: &[&str] = &["https://ip.3322.net", "https://ip.automate.org.cn"];
@@ -60,6 +66,50 @@ struct Config {
 
     /// 自定义 IP 获取服务地址（优先级高于内置公共 API）
     ip_echo_api: Option<String>,
+
+    // ---------- TLS 隧道配置（可选） ----------
+    #[serde(default)]
+    tunnel_enable: bool,
+
+    #[serde(default = "default_tunnel_local_addr")]
+    tunnel_local_addr: String,
+
+    #[serde(default)]
+    tunnel_remote_addr: String,
+
+    #[serde(default = "default_tunnel_server_name")]
+    tunnel_server_name: String,
+
+    #[serde(default)]
+    tunnel_ca_cert: Option<String>,
+
+    #[serde(default)]
+    tunnel_client_cert: Option<String>,
+
+    #[serde(default)]
+    tunnel_client_key: Option<String>,
+
+    // 隧道高级配置
+    #[serde(default = "default_tunnel_max_connections")]
+    tunnel_max_connections: usize,
+
+    #[serde(default = "default_tunnel_idle_timeout_secs")]
+    tunnel_idle_timeout_secs: u64,
+
+    #[serde(default = "default_tunnel_connect_timeout_secs")]
+    tunnel_connect_timeout_secs: u64,
+
+    #[serde(default = "default_tunnel_retry_delay_secs")]
+    tunnel_retry_delay_secs: u64,
+
+    #[serde(default = "default_tunnel_max_retry_delay_secs")]
+    tunnel_max_retry_delay_secs: u64,
+
+    #[serde(default = "default_tunnel_buffer_size")]
+    tunnel_buffer_size: usize,
+
+    #[serde(default)]
+    tunnel_disable_tls_resumption: bool,
 }
 
 fn default_server_id() -> String {
@@ -85,6 +135,30 @@ fn default_ip_refresh_interval() -> u64 {
 }
 fn default_enable_rtc() -> bool {
     true
+}
+fn default_tunnel_local_addr() -> String {
+    "127.0.0.1:18080".to_string()
+}
+fn default_tunnel_server_name() -> String {
+    "tunnel.example.com".to_string()
+}
+fn default_tunnel_max_connections() -> usize {
+    100
+}
+fn default_tunnel_idle_timeout_secs() -> u64 {
+    300
+}
+fn default_tunnel_connect_timeout_secs() -> u64 {
+    10
+}
+fn default_tunnel_retry_delay_secs() -> u64 {
+    2
+}
+fn default_tunnel_max_retry_delay_secs() -> u64 {
+    30
+}
+fn default_tunnel_buffer_size() -> usize {
+    64 * 1024 // 64KB
 }
 
 // ---------- 工具函数 ----------
@@ -115,10 +189,8 @@ fn get_interface_ip(iface: &str) -> Result<String> {
 
 /// 将配置字符串中的 {ip} 和 {interface:网卡名} 替换为实际 IP
 fn resolve_placeholder(base: &str, public_ip: &str) -> String {
-    // 先替换 {ip}
     let mut result = base.replace("{ip}", public_ip);
 
-    // 替换 {interface:NAME}
     let mut search_from = 0;
     while let Some(start_rel) = result[search_from..].find("{interface:") {
         let start = search_from + start_rel;
@@ -129,14 +201,13 @@ fn resolve_placeholder(base: &str, public_ip: &str) -> String {
                 Ok(ip) => ip,
                 Err(e) => {
                     warn!("Failed to get IP for interface '{}': {:?}", iface, e);
-                    // 保留原文，但设置 search_from 跳过此占位符，避免死循环
                     format!("{{interface:{}}}", iface)
                 }
             };
             result.replace_range(start..=end, &replacement);
-            search_from = start + replacement.len(); // 继续从此处之后查找
+            search_from = start + replacement.len();
         } else {
-            break; // 没有闭合括号，停止解析
+            break;
         }
     }
 
@@ -145,12 +216,10 @@ fn resolve_placeholder(base: &str, public_ip: &str) -> String {
 
 // ---------- 获取公网 IP（按优先级）----------
 async fn get_public_ip(client: &Client, config: &Config, url_index: &mut usize) -> Result<String> {
-    // 1. 手动指定 IP
     if let Some(ip) = &config.custom_ip {
         return Ok(ip.clone());
     }
 
-    // 2. 指定网卡 IP
     if let Some(iface) = &config.interface {
         if let Ok(ip) = get_interface_ip(iface) {
             return Ok(ip);
@@ -161,7 +230,6 @@ async fn get_public_ip(client: &Client, config: &Config, url_index: &mut usize) 
         );
     }
 
-    // 3. 自定义 IP 服务（新增）
     if let Some(url) = &config.ip_echo_api {
         let resp = client
             .get(url)
@@ -183,7 +251,6 @@ async fn get_public_ip(client: &Client, config: &Config, url_index: &mut usize) 
         warn!("Custom IP service returned invalid response, falling back to built-in APIs");
     }
 
-    // 4. 外网 API（轮流访问，只访问一个）
     let url = API_URLS[*url_index % API_URLS.len()];
     *url_index += 1;
 
@@ -279,7 +346,6 @@ async fn report_status(
     public_ip: &str,
     version: &str,
 ) -> Result<()> {
-    // 1. 确定 http_fmp4_base（支持占位符）
     let http_fmp4_base_raw = if let Some(custom) = &config.http_fmp4_base {
         custom.clone()
     } else {
@@ -288,7 +354,6 @@ async fn report_status(
     };
     let http_fmp4_base = resolve_placeholder(&http_fmp4_base_raw, public_ip);
 
-    // 2. 确定 static_base（支持占位符）
     let static_base_raw = config
         .static_base
         .clone()
@@ -322,9 +387,42 @@ async fn report_status(
     Ok(())
 }
 
+// ---------- 构建 TLS 连接器（用于隧道） ----------
+fn build_tls_connector(config: &Config) -> Result<TlsConnector> {
+    let mut roots = rustls::RootCertStore::empty();
+    if let Some(ca) = &config.tunnel_ca_cert {
+        let bytes = std::fs::read(ca)?;
+        for c in rustls_pemfile::certs(&mut bytes.as_slice()) {
+            roots.add(c?)?;
+        }
+    } else {
+        for c in rustls_native_certs::load_native_certs()? {
+            roots.add(c)?;
+        }
+    }
+
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let mut client_config = match (&config.tunnel_client_cert, &config.tunnel_client_key) {
+        (Some(cert), Some(key)) => {
+            let certs = rustls_pemfile::certs(&mut std::fs::read(cert)?.as_slice())
+                .collect::<Result<Vec<_>, _>>()?;
+            let key = rustls_pemfile::private_key(&mut std::fs::read(key)?.as_slice())?
+                .ok_or_else(|| anyhow!("Invalid client key"))?;
+            builder.with_client_auth_cert(certs, key)?
+        }
+        _ => builder.with_no_client_auth(),
+    };
+
+    // 根据配置决定是否禁用 TLS 会话恢复
+    if config.tunnel_disable_tls_resumption {
+        client_config.resumption = rustls::client::Resumption::disabled();
+    }
+
+    Ok(TlsConnector::from(Arc::new(client_config)))
+}
+
 // ---------- 持续运行主循环 ----------
-async fn run_loop(client: &Client, config: &Config) {
-    // 启动时获取一次版本，并缓存（后续不再更新）
+async fn run_loop(client: &Client, config: &Config, shutdown: Arc<Notify>) {
     let cached_version = get_zlm_version(client, config).await;
     info!("ZLM version (cached): {}", cached_version);
 
@@ -339,8 +437,11 @@ async fn run_loop(client: &Client, config: &Config) {
 
     loop {
         tokio::select! {
+            _ = shutdown.notified() => {
+                info!("Shutdown signal received, exiting main loop.");
+                break;
+            }
             _ = report_tick.tick() => {
-                // 周期上报
                 if let Some(ip) = &cached_ip {
                     if let Err(e) = report_status(client, config, ip, &cached_version).await {
                         warn!("Periodic report failed: {:?}", e);
@@ -348,7 +449,6 @@ async fn run_loop(client: &Client, config: &Config) {
                         info!("Periodic report sent.");
                     }
                 } else {
-                    // 尚无 IP，尝试立即获取并上报
                     match get_public_ip(client, config, &mut url_index).await {
                         Ok(ip) => {
                             cached_ip = Some(ip.clone());
@@ -363,7 +463,6 @@ async fn run_loop(client: &Client, config: &Config) {
                 }
             }
             _ = ip_refresh_tick.tick() => {
-                // 刷新 IP，变化时立即上报
                 match get_public_ip(client, config, &mut url_index).await {
                     Ok(ip) => {
                         if cached_ip.as_ref() != Some(&ip) {
@@ -374,7 +473,6 @@ async fn run_loop(client: &Client, config: &Config) {
                                 update_extern_ip(client, config, &ip).await;
                             }
 
-                            // IP 变化时立即上报，但版本仍使用启动时缓存的版本
                             if let Err(e) = report_status(client, config, &ip, &cached_version).await {
                                 warn!("Immediate report after IP change failed: {:?}", e);
                             } else {
@@ -388,10 +486,6 @@ async fn run_loop(client: &Client, config: &Config) {
                         warn!("Failed to refresh IP: {:?}", e);
                     }
                 }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received shutdown signal, exiting.");
-                break;
             }
         }
     }
@@ -410,8 +504,63 @@ async fn main() -> Result<()> {
         .build()
         .context("Failed to build HTTP client")?;
 
-    run_loop(&client, &config).await;
+    let shutdown = Arc::new(Notify::new());
 
-    #[allow(unreachable_code)]
+    // 监听 Ctrl+C，触发通知
+    let shutdown_clone = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_clone.notify_waiters();
+    });
+
+    // 如果启用了 TLS 隧道，则启动它
+    if config.tunnel_enable {
+        // 验证远程地址格式（可解析）
+        if config.tunnel_remote_addr.is_empty() {
+            return Err(anyhow!(
+                "TUNNEL_REMOTE_ADDR must be set when tunnel is enabled"
+            ));
+        }
+
+        let mut addrs = tokio::net::lookup_host(&config.tunnel_remote_addr)
+            .await
+            .context("Invalid TUNNEL_REMOTE_ADDR")?;
+        if addrs.next().is_none() {
+            return Err(anyhow!("TUNNEL_REMOTE_ADDR did not resolve to any address"));
+        }
+
+        let server_name = ServerName::try_from(config.tunnel_server_name.clone())
+            .map_err(|e| anyhow!("Invalid tunnel server name: {}", e))?;
+        let connector = build_tls_connector(&config)?;
+
+        let tunnel_cfg = Arc::new(tunnel::TunnelConfig {
+            local_addr: config.tunnel_local_addr.clone(),
+            remote_addr: config.tunnel_remote_addr.clone(),
+            server_name,
+            connector,
+            max_connections: config.tunnel_max_connections,
+            idle_timeout: (config.tunnel_idle_timeout_secs > 0)
+                .then(|| Duration::from_secs(config.tunnel_idle_timeout_secs)),
+            connect_timeout: Duration::from_secs(config.tunnel_connect_timeout_secs),
+            retry_delay: Duration::from_secs(config.tunnel_retry_delay_secs),
+            max_retry_delay: Duration::from_secs(config.tunnel_max_retry_delay_secs),
+            buffer_size: config.tunnel_buffer_size,
+        });
+
+        let shutdown_clone = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tunnel::run_tls_tunnel(tunnel_cfg, shutdown_clone).await {
+                log::error!("TLS tunnel failed: {}", e);
+            }
+        });
+
+        info!(
+            "TLS tunnel enabled: {} -> {}",
+            config.tunnel_local_addr, config.tunnel_remote_addr
+        );
+    }
+
+    run_loop(&client, &config, shutdown).await;
+
     Ok(())
 }

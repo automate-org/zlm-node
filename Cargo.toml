@@ -1,21 +1,26 @@
 [package]
 name = "zlm-node"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "zlm-node是一个用于将 ZLMediaKit 节点状态上报到管理平台（如 GBHub）的轻量级代理程序。"
 license = "MIT"
 repository = "https://github.com/automate-org/zlm-node"
+
 [dependencies]
 anyhow = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "signal"] }
+tokio = { version = "1.38", features = ["rt-multi-thread", "net", "time", "macros", "signal", "sync"] }
 envy = "0.4"
 get_if_addrs = "0.5"
 log = "0.4"
 env_logger = "0.11"
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+rustls-native-certs = "0.7"
 
 [profile.release]
 opt-level = 3
@@ -24,7 +29,6 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
-# The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "thin"

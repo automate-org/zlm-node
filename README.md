@@ -84,6 +84,53 @@ export HTTP_FMP4_BASE="http://{interface:eth1}:9080/"
 export HTTP_FMP4_BASE="https://{ip}:9443/live/"
 ```
 ---
+## TLS 隧道功能（可选）
+
+`zlm-node` 支持将 ZLMediaKit 的 Hook 请求通过 TLS 加密隧道转发到远程管理平台。启用后，ZLM 的 Hook 地址只需指向本地隧道端口，由 `zlm-node` 负责加密传输和网络穿透。
+
+### 配置环境变量
+
+| 环境变量 | 类型 | 默认值 | 说明 |
+|----------|------|--------|------|
+| `TUNNEL_ENABLE` | bool | `false` | 是否启用 TLS 隧道 |
+| `TUNNEL_LOCAL_ADDR` | string | `127.0.0.1:18080` | 本地隧道监听地址 |
+| `TUNNEL_REMOTE_ADDR` | string | 空 | 远程 TLS 服务地址（必须设置） |
+| `TUNNEL_SERVER_NAME` | string | `tunnel.example.com` | TLS 服务器名称（域名） |
+| `TUNNEL_CA_CERT` | string (可选) | 无 | 自定义 CA 证书路径 |
+| `TUNNEL_CLIENT_CERT` | string (可选) | 无 | 客户端证书路径（mTLS） |
+| `TUNNEL_CLIENT_KEY` | string (可选) | 无 | 客户端私钥路径（mTLS） |
+| `TUNNEL_MAX_CONNECTIONS` | usize | `100` | 最大并发连接数 |
+| `TUNNEL_IDLE_TIMEOUT_SECS` | u64 | `300` | 连接空闲超时（秒），0 表示禁用 |
+| `TUNNEL_CONNECT_TIMEOUT_SECS` | u64 | `10` | 远程连接超时（秒） |
+| `TUNNEL_RETRY_DELAY_SECS` | u64 | `2` | 连接失败后初始重试延迟（秒） |
+| `TUNNEL_MAX_RETRY_DELAY_SECS` | u64 | `30` | 指数退避最大延迟（秒） |
+| `TUNNEL_BUFFER_SIZE` | usize | `65536` | 数据传输缓冲区大小（字节） |
+| `TUNNEL_DISABLE_TLS_RESUMPTION` | bool | `false` | 是否禁用 TLS 会话恢复 |
+
+### 启用隧道
+
+设置环境变量并启动 `zlm-node`：
+```bash
+export TUNNEL_ENABLE=true
+export TUNNEL_LOCAL_ADDR=127.0.0.1:18080
+export TUNNEL_REMOTE_ADDR=tunnel.example.com:443
+export TUNNEL_SERVER_NAME=tunnel.example.com
+export TUNNEL_CA_CERT=/etc/zlm-node/ca.pem
+./zlm-node
+```
+### 修改 ZLMediaKit 配置
+
+编辑 ZLMediaKit 的 `config.ini`，将 `[hook]` 部分的所有 URL 改为本地隧道地址：
+```ini
+  [hook]
+  on_play=http://127.0.0.1:18080/hook/on_play
+  on_publish=http://127.0.0.1:18080/hook/on_publish
+  on_stream_changed=http://127.0.0.1:18080/hook/on_stream_changed
+  on_rtsp_realm=http://127.0.0.1:18080/hook/on_rtsp_realm
+  # 其他 hook 同样修改
+```
+重启 ZLMediaKit 使配置生效。之后所有 Hook 请求都会通过 `zlm-node` 加密转发到远程服务。
+---
 
 ## 🔧 配置示例
 
