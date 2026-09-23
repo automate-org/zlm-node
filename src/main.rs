@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use log::{info, warn};
+use log::{error, info, warn};
 use reqwest::Client;
 use rustls::pki_types::ServerName;
 use serde::Deserialize;
@@ -8,13 +8,14 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_rustls::TlsConnector;
 
+mod record_hook;
 mod tunnel;
 
 // ---------- 外网 API 列表 ----------
 const API_URLS: &[&str] = &["https://ip.3322.net", "https://ip.automate.org.cn"];
 
 // ---------- 配置 ----------
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Config {
     #[serde(default = "default_server_id")]
     server_id: String,
@@ -31,10 +32,7 @@ struct Config {
     #[serde(default)]
     node_token: String,
 
-    /// 手动指定公网 IP（优先级最高）
     custom_ip: Option<String>,
-
-    /// 指定网卡名称（如 eth0），优先级在 custom_ip 之后、外网 API 之前
     interface: Option<String>,
 
     #[serde(default = "default_zlm_http_port")]
@@ -46,25 +44,20 @@ struct Config {
     #[serde(default = "default_report_interval")]
     report_interval_secs: u64,
 
-    /// IP 刷新间隔（秒），默认 5 秒
     #[serde(default = "default_ip_refresh_interval")]
     ip_refresh_interval_secs: u64,
 
-    /// 静态资源基地址（若不设置则与 http_fmp4_base 相同）
     static_base: Option<String>,
 
     #[serde(default)]
     tls_accept_invalid_certs: bool,
 
-    /// 是否启用自动更新 ZLM 的 rtc.externIP（默认 true）
     #[serde(default = "default_enable_rtc")]
     enable_rtc_extern_ip_update: bool,
 
-    /// 手动指定 http_fmp4_base（优先级最高，覆盖自动生成）
     #[serde(default)]
     http_fmp4_base: Option<String>,
 
-    /// 自定义 IP 获取服务地址（优先级高于内置公共 API）
     ip_echo_api: Option<String>,
 
     // ---------- TLS 隧道配置（可选） ----------
@@ -89,7 +82,6 @@ struct Config {
     #[serde(default)]
     tunnel_client_key: Option<String>,
 
-    // 隧道高级配置
     #[serde(default = "default_tunnel_max_connections")]
     tunnel_max_connections: usize,
 
@@ -110,6 +102,29 @@ struct Config {
 
     #[serde(default)]
     tunnel_disable_tls_resumption: bool,
+
+    // ---------- 录像 hook 服务（可选） ----------
+    #[serde(default)]
+    record_hook_enable: bool,
+
+    #[serde(default = "default_hook_listen")]
+    hook_listen: String,
+
+    #[serde(default = "default_mgr_base")]
+    mgr_base: String,
+
+    #[serde(default)]
+    internal_api_token: String,
+
+    #[serde(default = "default_record_keep_on_failure")]
+    record_keep_on_failure: bool,
+
+    #[serde(default = "default_record_hook_sync_interval")]
+    record_hook_sync_interval_secs: u64,
+
+    /// 是否启用 S3 上传（默认 false）
+    #[serde(default = "default_record_s3_enable")]
+    record_s3_enable: bool,
 }
 
 fn default_server_id() -> String {
@@ -158,7 +173,22 @@ fn default_tunnel_max_retry_delay_secs() -> u64 {
     30
 }
 fn default_tunnel_buffer_size() -> usize {
-    64 * 1024 // 64KB
+    64 * 1024
+}
+fn default_hook_listen() -> String {
+    "127.0.0.1:3004".into()
+}
+fn default_mgr_base() -> String {
+    "http://127.0.0.1:3002".into()
+}
+fn default_record_keep_on_failure() -> bool {
+    true
+}
+fn default_record_hook_sync_interval() -> u64 {
+    60
+}
+fn default_record_s3_enable() -> bool {
+    false
 }
 
 // ---------- 工具函数 ----------
@@ -166,7 +196,6 @@ fn hash_token(token: &str) -> String {
     blake3::hash(token.as_bytes()).to_string()
 }
 
-/// 从文本中提取第一个 IPv4 地址
 fn extract_ipv4(text: &str) -> Option<String> {
     text.split(|c: char| !c.is_ascii_digit() && c != '.')
         .filter(|s| !s.is_empty())
@@ -174,7 +203,6 @@ fn extract_ipv4(text: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// 获取指定网卡的第一个 IPv4 地址
 fn get_interface_ip(iface: &str) -> Result<String> {
     let ifaces = get_if_addrs::get_if_addrs().context("Failed to query network interfaces")?;
     for iface_info in ifaces {
@@ -187,7 +215,6 @@ fn get_interface_ip(iface: &str) -> Result<String> {
     anyhow::bail!("Interface '{}' not found or has no IPv4 address", iface)
 }
 
-/// 将配置字符串中的 {ip} 和 {interface:网卡名} 替换为实际 IP
 fn resolve_placeholder(base: &str, public_ip: &str) -> String {
     let mut result = base.replace("{ip}", public_ip);
 
@@ -236,7 +263,6 @@ async fn get_public_ip(client: &Client, config: &Config, url_index: &mut usize) 
             .send()
             .await
             .with_context(|| format!("Failed to query custom IP service {}", url))?;
-
         let text = resp
             .text()
             .await
@@ -259,7 +285,6 @@ async fn get_public_ip(client: &Client, config: &Config, url_index: &mut usize) 
         .send()
         .await
         .with_context(|| format!("Failed to query {}", url))?;
-
     let text = resp
         .text()
         .await
@@ -312,6 +337,29 @@ fn get_json_str(value: &serde_json::Value, key: &str) -> Option<String> {
         .map(String::from)
 }
 
+// ---------- 获取 ZLM 的 mediaServerId ----------
+async fn get_zlm_media_server_id(client: &Client, config: &Config) -> Option<String> {
+    let url = format!(
+        "{}/index/api/getServerConfig?secret={}",
+        config.api_base, config.secret
+    );
+    let resp: serde_json::Value = client
+        .get(&url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    resp["data"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|d| d["general"]["mediaServerId"].as_str())
+        .map(String::from)
+}
+
 // ---------- 更新 ZLM 的 rtc.externIP ----------
 async fn update_extern_ip(client: &Client, config: &Config, ip: &str) {
     let url = format!(
@@ -335,6 +383,48 @@ async fn update_extern_ip(client: &Client, config: &Config, ip: &str) {
         }
         Err(e) => {
             warn!("Failed to update rtc.externIP: {:?}", e);
+        }
+    }
+}
+
+// ---------- 设置 ZLM 的 on_record_mp4 hook ----------
+async fn set_record_hook(client: &Client, config: &Config) {
+    let hook_url = {
+        let port = config.hook_listen.rsplit(':').next().unwrap_or("3004");
+        let host = config
+            .hook_listen
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or("127.0.0.1");
+        let host = if host == "0.0.0.0" || host == "::" {
+            "127.0.0.1"
+        } else {
+            host
+        };
+        format!("http://{}:{}/hook/on_record_mp4", host, port)
+    };
+
+    let url = format!(
+        "{}/index/api/setServerConfig?secret={}",
+        config.api_base, config.secret
+    );
+    let body = serde_json::json!({
+        "hook.on_record_mp4": hook_url
+    });
+
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                info!("[record-hook] set ZLM hook.on_record_mp4 = {}", hook_url);
+            } else {
+                warn!(
+                    "[record-hook] failed to set hook, HTTP {}",
+                    resp.status().as_u16()
+                );
+            }
+        }
+        Err(e) => {
+            warn!("[record-hook] failed to set hook: {:?}", e);
         }
     }
 }
@@ -363,7 +453,7 @@ async fn report_status(
     let hashed_token = hash_token(&config.node_token);
 
     let payload = serde_json::json!({
-        "server_id": config.server_id,
+        "server_id": config.server_id,   // = mediaServerId（main 里已覆盖）
         "api_base": config.api_base,
         "secret": config.secret,
         "public_ip": public_ip,
@@ -387,40 +477,42 @@ async fn report_status(
     Ok(())
 }
 
-// ---------- 构建 TLS 连接器（用于隧道） ----------
+// ---------- 构建 TLS 连接器 ----------
 fn build_tls_connector(config: &Config) -> Result<TlsConnector> {
     let mut roots = rustls::RootCertStore::empty();
     if let Some(ca) = &config.tunnel_ca_cert {
         let bytes = std::fs::read(ca)?;
         for c in rustls_pemfile::certs(&mut bytes.as_slice()) {
-            roots.add(c?)?;
+            roots.add(c?)?; // ✅ 保留 c? —— 元素是 Result<CertificateDer>
         }
     } else {
         for c in rustls_native_certs::load_native_certs()? {
-            roots.add(c)?;
+            roots.add(c)?; // ✅ 不加 ? —— 元素是裸 CertificateDer
         }
     }
 
     let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
     let mut client_config = match (&config.tunnel_client_cert, &config.tunnel_client_key) {
         (Some(cert), Some(key)) => {
-            let certs = rustls_pemfile::certs(&mut std::fs::read(cert)?.as_slice())
-                .collect::<Result<Vec<_>, _>>()?;
-            let key = rustls_pemfile::private_key(&mut std::fs::read(key)?.as_slice())?
+            let cert_bytes = std::fs::read(cert)?;
+            // ✅ 保留 .collect::<Result<...>>()?
+            let certs: Vec<_> =
+                rustls_pemfile::certs(&mut cert_bytes.as_slice()).collect::<Result<Vec<_>, _>>()?;
+
+            let key_bytes = std::fs::read(key)?;
+            let key = rustls_pemfile::private_key(&mut key_bytes.as_slice())?
                 .ok_or_else(|| anyhow!("Invalid client key"))?;
             builder.with_client_auth_cert(certs, key)?
         }
         _ => builder.with_no_client_auth(),
     };
 
-    // 根据配置决定是否禁用 TLS 会话恢复
     if config.tunnel_disable_tls_resumption {
         client_config.resumption = rustls::client::Resumption::disabled();
     }
 
     Ok(TlsConnector::from(Arc::new(client_config)))
 }
-
 // ---------- 持续运行主循环 ----------
 async fn run_loop(client: &Client, config: &Config, shutdown: Arc<Notify>) {
     let cached_version = get_zlm_version(client, config).await;
@@ -495,7 +587,7 @@ async fn run_loop(client: &Client, config: &Config, shutdown: Arc<Notify>) {
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let config: Config =
+    let mut config: Config =
         envy::from_env().context("Failed to load configuration from environment")?;
 
     let client = Client::builder()
@@ -504,18 +596,91 @@ async fn main() -> Result<()> {
         .build()
         .context("Failed to build HTTP client")?;
 
+    // ⬇️ 启动时从 ZLM 拉 mediaServerId，用它覆盖 config.server_id
+    match get_zlm_media_server_id(&client, &config).await {
+        Some(id) => {
+            info!("[init] detected ZLM mediaServerId = {}", id);
+            config.server_id = id;
+        }
+        None => {
+            warn!(
+                "[init] failed to get mediaServerId from ZLM, using configured server_id = {}",
+                config.server_id
+            );
+        }
+    }
+
     let shutdown = Arc::new(Notify::new());
 
-    // 监听 Ctrl+C，触发通知
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         shutdown_clone.notify_waiters();
     });
 
-    // 如果启用了 TLS 隧道，则启动它
+    // ⬇️ 录像 hook server
+    if config.record_hook_enable {
+        if config.internal_api_token.is_empty() {
+            return Err(anyhow!(
+                "INTERNAL_API_TOKEN must be set when RECORD_HOOK_ENABLE=true"
+            ));
+        }
+
+        let hook_state = Arc::new(record_hook::HookState {
+            mgr_base: config.mgr_base.clone(),
+            internal_api_token: config.internal_api_token.clone(),
+            http_client: client.clone(),
+            keep_on_failure: config.record_keep_on_failure,
+            server_id: config.server_id.clone(), // = mediaServerId
+            s3_enable: config.record_s3_enable,
+        });
+
+        let app = record_hook::router(hook_state);
+        let listen = config.hook_listen.clone();
+
+        let listener = tokio::net::TcpListener::bind(&listen)
+            .await
+            .with_context(|| format!("bind hook server to {} failed", listen))?;
+
+        info!("[record-hook] listening on {}", listen);
+
+        let shutdown_clone = shutdown.clone();
+        tokio::spawn(async move {
+            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                shutdown_clone.notified().await;
+            });
+            if let Err(e) = server.await {
+                error!("[record-hook] server error: {}", e);
+            }
+        });
+
+        // 启动时立即设置 hook
+        set_record_hook(&client, &config).await;
+
+        // 定期兜底：ZLM 重启后 hook 会丢
+        let sync_interval = Duration::from_secs(config.record_hook_sync_interval_secs.max(10));
+        let client_clone = client.clone();
+        let config_clone = config.clone();
+        let shutdown_clone = shutdown.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(sync_interval);
+            tick.tick().await; // 跳过第一次
+            loop {
+                tokio::select! {
+                    _ = shutdown_clone.notified() => {
+                        info!("[record-hook] sync loop exit");
+                        break;
+                    }
+                    _ = tick.tick() => {
+                        set_record_hook(&client_clone, &config_clone).await;
+                    }
+                }
+            }
+        });
+    }
+
+    // TLS 隧道
     if config.tunnel_enable {
-        // 验证远程地址格式（可解析）
         if config.tunnel_remote_addr.is_empty() {
             return Err(anyhow!(
                 "TUNNEL_REMOTE_ADDR must be set when tunnel is enabled"
