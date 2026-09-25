@@ -15,7 +15,7 @@
 - ✅ 支持 TLS 证书校验开关（自签名场景）
 - ✅ 低资源占用，适合嵌入式或家庭设备部署
 - ✅ **启动时自动从 ZLM 拉取 `mediaServerId` 作为节点标识，拿到后永久缓存**
-- ✅ **ZLM 版本自动获取并缓存（只在成功拿到时缓存，失败下次重试）**
+- ✅ **每次上报前实测 ZLM 版本；ZLM 挂了就上报 `version="offline"`，上级据此判断 ZLM 离线**
 - ✅ **内置 `--gen-token` 子命令，一键生成上报明文与哈希，安装脚本不再依赖 `b3sum`**
 - ✅ **支持 `NODE_TOKEN_SALT` 静态盐：使用 keyed blake3，`b3sum` 命令无法直接算出正确 hash**
 - ✅ **`NODE_TOKEN` 的 hash 只在进程启动时计算一次，之后零开销复用**
@@ -121,7 +121,10 @@ note: hash computed with NODE_TOKEN_SALT (keyed blake3)   ← 仅在带盐时出
 ### 节点标识与上报行为
 
 - **`mediaServerId`**：启动时从 ZLM `getServerConfig` 拉取，**成功一次后永久缓存**，之后不再请求
-- **`version`**：从 ZLM `/index/api/version` 拉取，**只在拿到真实版本号时缓存**，`offline` / `unknown` 不缓存，下次上报时重试
+- **`version`**：**每次上报前都实测 ZLM `/index/api/version`**
+  - 拿到真实版本号 → 上报真实版本（如 `master(a485d89)`），并更新缓存
+  - ZLM 挂了（HTTP 请求失败）→ 上报 **`"offline"`**，**上级据此判断 ZLM 离线**
+  - ZLM 活着但响应异常 → 优先用缓存兜底，否则上报 `"online (unknown version)"`
 - **`SERVER_ID`**（可选兜底）：
   - 未设置：`mediaServerId` 未就绪时跳过本次上报，等下一 tick 重试
   - 已设置：`mediaServerId` 未就绪时暂用该值，拿到后自动切换为 `mediaServerId`
@@ -438,29 +441,65 @@ export INTERFACE=eth0
 
 ## 🧪 验证
 
-1. 确认 zlm-node 日志输出类似：
+### 1. 正常上报
+
+确认 zlm-node 日志输出类似：
 
 ```
 [init] detected ZLM mediaServerId = zlmediakit-abc123
-ZLM version: master(a485d89)
+[init] ZLM version: master(a485d89)
 Periodic report sent (server_id=zlmediakit-abc123, version=master(a485d89)).
 ```
 
-**如果 ZLM 尚未启动**，会先看到：
+### 2. ZLM 未启动
+
+zlm-node 启动时 ZLM 还没起来，会看到：
 
 ```
 [init] mediaServerId unavailable, report will be skipped until ZLM ready
-[init] ZLM version unavailable, will retry later
+[init] ZLM is offline (version probe failed)
 Skip report: mediaServerId not ready and no SERVER_ID fallback
 ```
 
-这属于正常现象——ZLM 起来后最多等一个 `REPORT_INTERVAL_SECS`（默认 30s）就会自动转为正常上报。
+ZLM 起来后最多等一个 `REPORT_INTERVAL_SECS`（默认 30s）就会自动转为正常上报。
 
-2. 检查管理端是否收到节点状态更新。
+### 3. 验证"ZLM 挂了"能否被感知
 
-3. 如果启用了 `ENABLE_RTC_EXTERN_IP_UPDATE`，登录 ZLM 管理界面查看 `rtc.externIP` 是否已同步为公网 IP。
+zlm-node 每次上报前都会实测 ZLM 版本，**ZLM 挂掉后上报的 `version` 会变成 `"offline"`**：
 
-4. **如果启用了录像 hook**，看到以下日志说明就绪：
+```
+# 1. 确认当前版本
+redis-cli hget zlm_node:<id> version
+# → master(a485d89)
+
+# 2. 停掉 ZLM
+systemctl stop mediaserver
+
+# 3. 等一个上报周期（最多 30s + 余量）
+sleep 40
+
+# 4. 再看
+redis-cli hget zlm_node:<id> version
+# → offline
+
+# 5. 恢复 ZLM
+systemctl start mediaserver
+sleep 40
+
+# 6. 再看
+redis-cli hget zlm_node:<id> version
+# → master(a485d89)
+```
+
+**上级系统只要看 `version` 字段是不是 `"offline"` 就能判断 ZLM 是否离线。**
+
+### 4. rtc.externIP 同步
+
+如果启用了 `ENABLE_RTC_EXTERN_IP_UPDATE`，登录 ZLM 管理界面查看 `rtc.externIP` 是否已同步为公网 IP。
+
+### 5. 录像 hook 就绪
+
+如果启用了录像 hook，看到以下日志说明就绪：
 
 ```
 [record-hook] listening on 127.0.0.1:3004
@@ -475,7 +514,7 @@ Skip report: mediaServerId not ready and no SERVER_ID fallback
 
 说明 ZLM 的 `[api] secret` 和 zlm-node 的 `SECRET` 不一致。
 
-5. **手工触发录像 hook 测试**：
+### 6. 手工触发录像 hook 测试
 
 ```
 echo "test" > /tmp/test.mp4
@@ -517,6 +556,8 @@ curl -X POST http://127.0.0.1:3004/hook/on_record_mp4 \
 ### 4. 上报间隔调多少合适？
 
 家庭宽带 IP 变化不频繁，默认 `30` 秒已足够。如需更快感知 IP 变化，可适当降低至 `10` 秒。
+
+> **注意**：`version` 字段也跟随上报间隔刷新。ZLM 挂掉后最多等一个 `REPORT_INTERVAL_SECS` 才上报 `"offline"`。想更快感知 ZLM 离线就调小这个值。
 
 ### 5. 支持 Docker 部署吗？
 
@@ -587,7 +628,22 @@ curl -X POST http://127.0.0.1:3004/hook/on_record_mp4 \
 - **盐和 token 应尽量分开存放**（比如 salt 放单独的 `chmod 600` 文件）——同时泄漏两者等于没加盐；
 - **盐不是万能的**——进程内存被 dump 时仍然拿得到。
 
-### 12. ZLM 慢启动时 zlm-node 会怎样？
+### 12. `version` 字段怎么判断 ZLM 是否离线？
+
+**每次上报前 zlm-node 都会实测 ZLM `/index/api/version`**，把结果作为 `version` 字段上报：
+
+| ZLM 状态 | 上报的 `version` | 上级判断 |
+|---|---|---|
+| 正常 | `master(a485d89)` 等真实版本 | 在线 |
+| 活着但响应异常 | 缓存的历史版本（或 `online (unknown version)`） | 在线 |
+| **挂了（HTTP 请求失败）** | **`offline`** | **离线** |
+| 恢复 | 又变回真实版本 | 在线 |
+
+**上级系统只要判断 `version == "offline"` 就知道 ZLM 挂了。**
+
+**感知延迟**：最多一个 `REPORT_INTERVAL_SECS`（默认 30s）。想更快就调小它。
+
+### 13. ZLM 慢启动时 zlm-node 会怎样？
 
 自动自愈，无需干预：
 
@@ -595,11 +651,11 @@ curl -X POST http://127.0.0.1:3004/hook/on_record_mp4 \
 |---|---|---|---|
 | hook 设置 | 首次 set 失败 | 指数退避 2s→4s→…→30s | ZLM 起来后 ≤30s |
 | `mediaServerId` | 未就绪 | 每次上报前重试 | 起来后 ≤`IP_REFRESH_INTERVAL_SECS`（5s） |
-| `version` | 未就绪 | 每次上报前重试 | 同上 |
+| `version` | 上报 `"offline"` | 每次上报前重试 | 起来后 ≤`REPORT_INTERVAL_SECS`（30s） |
 | 状态上报 | 跳过（未配 `SERVER_ID`） | ZLM 起来后自动开始 | 5~30s |
 | hook 回调处理 | 不依赖 zlm-node 状态 | 直接用 body 里的 `mediaServerId` | 无 |
 
-### 13. hook 设置"看起来成功但没生效"怎么办？
+### 14. hook 设置"看起来成功但没生效"怎么办？
 
 zlm-node 已经校验了 **HTTP 200 且 ZLM 返回 `code == 0`**，只有两者都满足才算成功。如果日志显示：
 
@@ -611,7 +667,7 @@ zlm-node 已经校验了 **HTTP 200 且 ZLM 返回 `code == 0`**，只有两者�
 
 **`changed == 0` 不是失败**——它只表示"值未变化"（比如重复设置同一个 hook），`code == 0` 才是成功标志。
 
-### 14. 多机部署时 `NODE_TOKEN` 能共用吗？
+### 15. 多机部署时 `NODE_TOKEN` 能共用吗？
 
 **可以，但不推荐。**
 

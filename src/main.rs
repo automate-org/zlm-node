@@ -17,7 +17,7 @@ const API_URLS: &[&str] = &["https://ip.3322.net", "https://ip.automate.org.cn"]
 // ---------- 共享缓存类型 ----------
 /// mediaServerId 缓存：None = 未获取，Some = 已获取且永久缓存
 type MediaServerIdCache = Arc<RwLock<Option<String>>>;
-/// ZLM version 缓存：None = 未获取，Some = 已获取且永久缓存
+/// ZLM version 缓存：用于在 ZLM 活着但拿不到具体版本号时兜底
 type VersionCache = Arc<RwLock<Option<String>>>;
 
 // ---------- 配置 ----------
@@ -329,6 +329,10 @@ async fn get_public_ip(client: &Client, config: &Config, url_index: &mut usize) 
 }
 
 // ---------- 获取 ZLM 版本 ----------
+/// 直接请求 ZLM `/index/api/version`，返回原始结果：
+/// - 拿到真实版本号 → `"master(a485d89)"` 样式
+/// - 请求失败 / 连接错误 → `"offline"`
+/// - 响应不是合法 JSON / 缺字段 → `"online (unknown version)"`
 async fn get_zlm_version(client: &Client, config: &Config) -> String {
     let url = format!(
         "{}/index/api/version?secret={}",
@@ -355,23 +359,29 @@ async fn get_zlm_version(client: &Client, config: &Config) -> String {
     }
 }
 
-/// 已缓存 → 直接返回；未缓存 → 请求一次；
-/// 只有拿到真实版本号才写入缓存，"offline" / "online (unknown version)" 不缓存。
-async fn get_or_fetch_version(
-    client: &Client,
-    config: &Config,
-    cache: &VersionCache,
-) -> Option<String> {
-    if let Some(v) = cache.read().await.clone() {
-        return Some(v);
-    }
-    let v = get_zlm_version(client, config).await;
-    if v != "offline" && v != "online (unknown version)" {
-        info!("ZLM version: {}", v);
-        *cache.write().await = Some(v.clone());
-        Some(v)
-    } else {
-        None
+/// 解析本次上报要用的 version。**每次调用都真的去探测 ZLM**：
+/// - 拿到真实版本号  → 上报真实版本，并更新缓存
+/// - 拿到 "offline" → 上报 "offline"（ZLM 挂了），不污染缓存
+/// - 拿到 "online (unknown version)" → 优先用缓存兜底，否则上报 "online (unknown version)"
+///
+/// 上级系统只要看 `version` 字段是不是 `"offline"`，就能判断 ZLM 是否离线。
+async fn resolve_version(client: &Client, config: &Config, cache: &VersionCache) -> String {
+    let fresh = get_zlm_version(client, config).await;
+    match fresh.as_str() {
+        // ZLM 挂了 → 直接上报 "offline"，不缓存、不覆盖
+        "offline" => "offline".to_string(),
+
+        // ZLM 活着但拿不到具体版本号 → 优先用缓存（曾经拿到过的真实版本）
+        "online (unknown version)" => {
+            let cached = cache.read().await.clone();
+            cached.unwrap_or(fresh)
+        }
+
+        // 拿到真实版本 → 更新缓存 + 上报
+        v => {
+            *cache.write().await = Some(v.to_string());
+            v.to_string()
+        }
     }
 }
 
@@ -664,9 +674,8 @@ async fn run_loop(
                     }
                 };
 
-                let ver = get_or_fetch_version(client, config, &version)
-                    .await
-                    .unwrap_or_else(|| "offline".to_string());
+                // version 每次都实测：ZLM 挂了就是 "offline"
+                let ver = resolve_version(client, config, &version).await;
 
                 if cached_ip.is_none() {
                     match get_public_ip(client, config, &mut url_index).await {
@@ -692,9 +701,8 @@ async fn run_loop(
                     None => continue,
                 };
 
-                let ver = get_or_fetch_version(client, config, &version)
-                    .await
-                    .unwrap_or_else(|| "offline".to_string());
+                // version 每次都实测
+                let ver = resolve_version(client, config, &version).await;
 
                 match get_public_ip(client, config, &mut url_index).await {
                     Ok(ip) => {
@@ -806,11 +814,14 @@ async fn main() -> Result<()> {
             }
         }
     }
-    if get_or_fetch_version(&client, &config, &version)
-        .await
-        .is_none()
-    {
-        warn!("[init] ZLM version unavailable, will retry later");
+    // 启动时也探一次 version（结果只用于初始日志，实际上报时还会再探）
+    match get_zlm_version(&client, &config).await.as_str() {
+        "offline" => warn!("[init] ZLM is offline (version probe failed)"),
+        "online (unknown version)" => warn!("[init] ZLM version unknown"),
+        v => {
+            info!("[init] ZLM version: {}", v);
+            *version.write().await = Some(v.to_string());
+        }
     }
 
     let shutdown = Arc::new(Notify::new());
