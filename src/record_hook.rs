@@ -6,11 +6,6 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// 与 main.rs 里上报节点状态时用的 hash 完全一致
-fn hash_node_token(token: &str) -> String {
-    blake3::hash(token.as_bytes()).to_string()
-}
-
 /// 与 main.rs 里 MediaServerIdCache 保持同一类型
 pub type MediaServerIdCache = std::sync::Arc<tokio::sync::RwLock<Option<String>>>;
 
@@ -25,7 +20,9 @@ pub struct HookState {
     pub media_server_id: MediaServerIdCache,
     /// 可选兜底：缓存也为空时用它（来自 main 里 config.server_id）
     pub fallback_server_id: Option<String>,
-    pub node_token: String,
+    /// NODE_TOKEN 的 hash（含盐），由 main 计算好后传入。
+    /// 这里不持有明文 token，减少内存泄漏面。
+    pub node_token_hash: String,
 }
 
 pub fn router(state: Arc<HookState>) -> Router {
@@ -173,7 +170,7 @@ async fn do_upload_and_notify(state: Arc<HookState>, body: Value) -> Result<()> 
     let notify_ok = match state
         .http_client
         .post(&url)
-        .header("X-Node-Token", hash_node_token(&state.node_token))
+        .header("X-Node-Token", &state.node_token_hash)
         .json(&notify_payload)
         .timeout(Duration::from_secs(10))
         .send()
@@ -231,7 +228,7 @@ async fn upload_to_s3(
     let presign_resp: Value = state
         .http_client
         .post(&presign_url)
-        .header("X-Node-Token", hash_node_token(&state.node_token))
+        .header("X-Node-Token", &state.node_token_hash)
         .json(&json!({
             "stream": stream,
             "app": app,

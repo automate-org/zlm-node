@@ -16,7 +16,9 @@
 - ✅ 低资源占用，适合嵌入式或家庭设备部署
 - ✅ **启动时自动从 ZLM 拉取 `mediaServerId` 作为节点标识，拿到后永久缓存**
 - ✅ **ZLM 版本自动获取并缓存（只在成功拿到时缓存，失败下次重试）**
-- ✅ **内置 `--gen-token` 子命令，一键生成上报明文与 blake3 哈希，安装脚本不再依赖 `b3sum`**
+- ✅ **内置 `--gen-token` 子命令，一键生成上报明文与哈希，安装脚本不再依赖 `b3sum`**
+- ✅ **支持 `NODE_TOKEN_SALT` 静态盐：使用 keyed blake3，`b3sum` 命令无法直接算出正确 hash**
+- ✅ **`NODE_TOKEN` 的 hash 只在进程启动时计算一次，之后零开销复用**
 - ✅ **录像 hook 服务：接收 ZLM 的 `on_record_mp4` 事件，上传 S3 并通知 mgr**
 - ✅ **流式上传大文件（内存恒定 ~64KB，不受录像大小影响）**
 - ✅ **hook 自动重设（ZLM 重启后自动恢复），设成功判断 `code == 0`**
@@ -43,7 +45,19 @@ cargo build --release
 
 ### 生成上报令牌
 
-在部署 zlm-node 和 mgr 之前，用 zlm-node 自己生成一对令牌，避免手工 hash 出错：
+在部署 zlm-node 和 mgr 之前，用 zlm-node 自己生成一对令牌，避免手工 hash 出错。
+
+**推荐带盐生成**（`b3sum` 命令算不出，更安全）：
+
+```
+# 1. 生成一个随机盐
+export NODE_TOKEN_SALT=$(openssl rand -hex 32)
+
+# 2. 用盐生成 token
+./target/release/zlm-node --gen-token
+```
+
+**不带盐生成**（向后兼容旧部署）：
 
 ```
 ./target/release/zlm-node --gen-token
@@ -53,13 +67,17 @@ cargo build --release
 
 ```
 NODE_TOKEN=<64位hex 明文>
-NODE_REPORT_TOKEN=<64位hex blake3哈希>
+NODE_REPORT_TOKEN=<64位hex hash>
+note: hash computed with NODE_TOKEN_SALT (keyed blake3)   ← 仅在带盐时出现（输出到 stderr）
 ```
 
 - **`NODE_TOKEN`** → 填到 zlm-node 的 `NODE_TOKEN` 环境变量
+- **`NODE_TOKEN_SALT`** → 填到 zlm-node 的 `NODE_TOKEN_SALT` 环境变量（**必须和生成时一致**）
 - **`NODE_REPORT_TOKEN`** → 填到 mgr 的 `NODE_REPORT_TOKEN` 环境变量
 
-> ⚠️ 不要反过来填。zlm-node 会自己把 `NODE_TOKEN` 做 blake3 哈希，再作为 `X-Node-Token` 请求头发送；mgr 用 `NODE_REPORT_TOKEN` 直接比对。
+> ⚠️ **盐只在 zlm-node 侧配置，mgr 侧不需要**。mgr 只存最终 hash，直接比对即可。
+>
+> ⚠️ **带盐时**：hash 算法是 `blake3::keyed_hash(blake3(salt), token)`，**`b3sum` 命令算不出**——攻击者即使拿到 `NODE_TOKEN` 明文，也必须同时拿到 `NODE_TOKEN_SALT` 才能伪造请求。
 
 ### 运行
 
@@ -79,7 +97,8 @@ NODE_REPORT_TOKEN=<64位hex blake3哈希>
 
 | 变量名 | 默认值 | 必填 | 说明 |
 |--------|--------|------|------|
-| NODE_TOKEN | 空 | 是 | 节点鉴权令牌（**明文**，上报时内部自动 blake3 哈希，通过 `X-Node-Token` 头发送） |
+| NODE_TOKEN | 空 | 是 | 节点鉴权令牌（**明文**，上报时内部自动计算 hash，通过 `X-Node-Token` 头发送） |
+| NODE_TOKEN_SALT | 无 | 否 | **可选静态盐**。设置后使用 keyed blake3 计算 hash，`b3sum` 命令无法直接算出；**必须和 `--gen-token` 时用的盐一致** |
 | SERVER_ID | 无 | 否 | **可选兜底**节点 ID：仅当 `mediaServerId` 拉取失败时使用；未设置时未就绪阶段跳过上报 |
 | API_BASE | http://127.0.0.1:9080 | 否 | ZLM API 基础地址 |
 | SECRET | 无 | 是 | ZLM API 密钥，必须与 ZLM `config.ini` 的 `[api] secret` 一致 |
@@ -192,6 +211,7 @@ export MGR_BASE=http://mgr.internal:3002
 export RECORD_S3_ENABLE=true
 export RECORD_KEEP_ON_FAILURE=true
 export NODE_TOKEN=<--gen-token 生成的明文>
+export NODE_TOKEN_SALT=<生成时用的盐>
 ./zlm-node
 ```
 
@@ -236,36 +256,55 @@ zlm-node **只需要一个 `NODE_TOKEN`** 就能调用 mgr 的所有接口：
 | `POST /api/internal/presign-record` | 拿 S3 上传 URL |
 | `POST /api/internal/on-record-event` | 通知录像落库 |
 
-**两端配置**：
+**两端配置（推荐：带盐）**：
+
+```
+zlm-node 侧:  NODE_TOKEN       = 明文 token
+              NODE_TOKEN_SALT  = 盐（与 --gen-token 时一致）
+              └─ 内部计算 keyed hash: blake3::keyed_hash(blake3(salt), token)
+                 → 作为 X-Node-Token 发送
+
+mgr 侧:       NODE_REPORT_TOKEN = 上述 keyed hash 的 hex
+              └─ 直接和请求头 X-Node-Token 比对
+              （mgr 不需要知道盐）
+```
+
+**两端配置（不带盐，向后兼容）**：
 
 ```
 zlm-node 侧:  NODE_TOKEN          = 明文 token
-              └─ 内部 blake3 哈希后作为 X-Node-Token 发送
+              └─ 内部普通 blake3(token) → X-Node-Token
 
-mgr 侧:       NODE_REPORT_TOKEN   = blake3(NODE_TOKEN) 的 hex
-              └─ 直接和请求头 X-Node-Token 比对
+mgr 侧:       NODE_REPORT_TOKEN   = blake3(token) 的 hex
 ```
 
 **生成方式**：
 
 ```
+# 带盐（推荐）
+export NODE_TOKEN_SALT=$(openssl rand -hex 32)
+./zlm-node --gen-token
+
+# 不带盐
 ./zlm-node --gen-token
 ```
 
 **校验两边一致**：
 
 ```
-# 看 zlm-node 进程里的明文
-cat /proc/$(pgrep -f zlm-node)/environ | tr '\0' '\n' | grep '^NODE_TOKEN='
+# 看 zlm-node 进程里的明文和盐
+cat /proc/$(pgrep -f zlm-node)/environ | tr '\0' '\n' | grep -E '^(NODE_TOKEN|NODE_TOKEN_SALT)='
 
 # 看 mgr 进程里的 hash
 cat /proc/$(pgrep -f gbhub-mgr)/environ | tr '\0' '\n' | grep '^NODE_REPORT_TOKEN='
-
-# 手动算一遍验证
-echo -n "<明文>" | b3sum    # 应等于 mgr 的 hash
 ```
 
-> **常见坑**：两边都配同一个 hash → 双重 hash → 永远 401。**zlm-node 填明文，mgr 填 hash。**
+> **带盐时 `b3sum` 命令算不出**——`b3sum` 只支持普通 blake3，不支持 keyed 模式。攻击者必须知道算法（keyed blake3）**且**同时拿到明文 token 和盐，才能伪造。
+>
+> **不带盐时可以用 b3sum 验证**：
+> ```
+> echo -n "<明文>" | b3sum    # 应等于 mgr 的 hash
+> ```
 
 ### `INTERNAL_API_TOKEN` 与 zlm-node 无关
 
@@ -340,6 +379,7 @@ export API_BASE=http://127.0.0.1:9080
 export SECRET=<你的 ZLM secret>
 export MGR_URL=http://mgr.example.com:3002/api/zlm/report-status
 export NODE_TOKEN=<--gen-token 生成的明文>
+export NODE_TOKEN_SALT=<生成时用的盐>
 ./zlm-node
 ```
 
@@ -347,6 +387,7 @@ export NODE_TOKEN=<--gen-token 生成的明文>
 
 ```
 export NODE_TOKEN=<--gen-token 生成的明文>
+export NODE_TOKEN_SALT=<生成时用的盐>
 export API_BASE=http://127.0.0.1:9080
 export SECRET=your_zlm_secret
 export MGR_URL=http://your-gbhub-domain/api/zlm/report-status
@@ -365,6 +406,7 @@ export API_BASE=http://127.0.0.1:9080
 export SECRET=your_zlm_secret
 export MGR_URL=http://mgr.internal:3002/api/zlm/report-status
 export NODE_TOKEN=<--gen-token 生成的明文>
+export NODE_TOKEN_SALT=<生成时用的盐>
 
 # 录像 hook
 export RECORD_HOOK_ENABLE=true
@@ -511,11 +553,41 @@ curl -X POST http://127.0.0.1:3004/hook/on_record_mp4 \
 
 ### 10. `--gen-token` 和手工用 `b3sum` 有什么区别？
 
-`--gen-token` 内部直接调用 Rust 的 `blake3` crate 计算哈希，与运行时 `hash_token()` 使用的是**同一实现**，天然一致。手工用 `b3sum` 时容易踩 `echo -n` 缺换行、`\r` 混入、编码不一致等坑，导致两边算出的 hash 不同、永远 401。
+**带盐（设置了 `NODE_TOKEN_SALT`）时**：
 
-**推荐始终用 `--gen-token` 生成。**
+- `--gen-token` 内部用 `blake3::keyed_hash(blake3(salt), token)`；
+- **`b3sum` 命令完全不支持 keyed 模式**，无论如何都算不出正确 hash；
+- 攻击者必须知道算法、知道盐、知道明文，才能算出正确 hash。
 
-### 11. ZLM 慢启动时 zlm-node 会怎样？
+**不带盐时**：
+
+- 与 `b3sum` 兼容：`echo -n "<明文>" | b3sum` 应该等于 `NODE_REPORT_TOKEN`；
+- 手工用 `b3sum` 时容易踩 `echo -n` 缺换行、`\r` 混入、编码不一致等坑，导致两边算出的 hash 不同、永远 401。
+
+**推荐**：始终带盐，用 `--gen-token` 生成。
+
+### 11. `NODE_TOKEN_SALT` 有什么用？
+
+`NODE_TOKEN_SALT` 是一个**静态盐**，让 hash 从普通 blake3 变成 keyed blake3：
+
+```
+无盐：  hash = blake3(token)
+带盐：  hash = blake3::keyed_hash(blake3(salt), token)
+```
+
+**优势**：
+
+- **`b3sum` 命令无法算出** —— `b3sum` 只支持无 key 模式；
+- **仅泄漏 `NODE_TOKEN` 无法伪造** —— 攻击者还得同时拿到 salt；
+- **mgr 侧不需要知道盐** —— 只存最终 hash，比对逻辑不变。
+
+**注意**：
+
+- **盐必须和 `--gen-token` 时一致**——改了盐等于改了 hash，两边对不上；
+- **盐和 token 应尽量分开存放**（比如 salt 放单独的 `chmod 600` 文件）——同时泄漏两者等于没加盐；
+- **盐不是万能的**——进程内存被 dump 时仍然拿得到。
+
+### 12. ZLM 慢启动时 zlm-node 会怎样？
 
 自动自愈，无需干预：
 
@@ -527,7 +599,7 @@ curl -X POST http://127.0.0.1:3004/hook/on_record_mp4 \
 | 状态上报 | 跳过（未配 `SERVER_ID`） | ZLM 起来后自动开始 | 5~30s |
 | hook 回调处理 | 不依赖 zlm-node 状态 | 直接用 body 里的 `mediaServerId` | 无 |
 
-### 12. hook 设置"看起来成功但没生效"怎么办？
+### 13. hook 设置"看起来成功但没生效"怎么办？
 
 zlm-node 已经校验了 **HTTP 200 且 ZLM 返回 `code == 0`**，只有两者都满足才算成功。如果日志显示：
 
@@ -539,7 +611,7 @@ zlm-node 已经校验了 **HTTP 200 且 ZLM 返回 `code == 0`**，只有两者�
 
 **`changed == 0` 不是失败**——它只表示"值未变化"（比如重复设置同一个 hook），`code == 0` 才是成功标志。
 
-### 13. 多机部署时 `NODE_TOKEN` 能共用吗？
+### 14. 多机部署时 `NODE_TOKEN` 能共用吗？
 
 **可以，但不推荐。**
 

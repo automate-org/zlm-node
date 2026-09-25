@@ -3,7 +3,7 @@ use log::{error, info, warn};
 use reqwest::Client;
 use rustls::pki_types::ServerName;
 use serde::Deserialize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 use tokio_rustls::TlsConnector;
@@ -38,6 +38,12 @@ struct Config {
 
     #[serde(default)]
     node_token: String,
+
+    /// 可选：NODE_TOKEN 的静态盐。
+    /// 设置后 hash = blake3::keyed_hash(blake3(salt), token)，
+    /// b3sum 命令无法直接算出该 hash，且仅泄漏 NODE_TOKEN 时也无法伪造请求。
+    /// 注意：生成 `NODE_REPORT_TOKEN` 时和运行时必须用同一个盐。
+    node_token_salt: Option<String>,
 
     custom_ip: Option<String>,
     interface: Option<String>,
@@ -193,8 +199,30 @@ fn default_record_s3_enable() -> bool {
 }
 
 // ---------- 工具函数 ----------
-fn hash_token(token: &str) -> String {
-    blake3::hash(token.as_bytes()).to_string()
+
+/// 计算 NODE_TOKEN 的 hash：
+/// - 设了 `NODE_TOKEN_SALT` → `blake3::keyed_hash(blake3(salt), token)`
+///   （b3sum 命令无法直接算出，且仅泄漏 NODE_TOKEN 时也无法伪造）
+/// - 没设 → 普通 `blake3(token)`（向后兼容旧部署）
+fn hash_token(token: &str, salt: Option<&str>) -> String {
+    match salt.filter(|s| !s.is_empty()) {
+        Some(s) => {
+            // keyed_hash 要求 key 恰好 32 字节，用 blake3(salt) 得出
+            let key_hash = blake3::hash(s.as_bytes());
+            let key: &[u8; 32] = key_hash.as_bytes();
+            blake3::keyed_hash(key, token.as_bytes()).to_string()
+        }
+        None => blake3::hash(token.as_bytes()).to_string(),
+    }
+}
+
+/// NODE_TOKEN 的 hash（含盐）。进程内首次调用算一次，之后零开销。
+static HASHED_NODE_TOKEN: OnceLock<String> = OnceLock::new();
+
+fn hashed_node_token(config: &Config) -> &'static str {
+    HASHED_NODE_TOKEN
+        .get_or_init(|| hash_token(&config.node_token, config.node_token_salt.as_deref()))
+        .as_str()
 }
 
 fn extract_ipv4(text: &str) -> Option<String> {
@@ -538,7 +566,8 @@ async fn report_status(
         .unwrap_or_else(|| http_fmp4_base.clone());
     let static_base = resolve_placeholder(&static_base_raw, public_ip);
 
-    let hashed_token = hash_token(&config.node_token);
+    // hash 只算一次（进程内缓存）
+    let hashed_token = hashed_node_token(config);
 
     let payload = serde_json::json!({
         "server_id": server_id,
@@ -705,8 +734,18 @@ async fn run_loop(
 ///
 /// 语义：
 ///   - NODE_TOKEN          明文，填给 zlm-node 的 `NODE_TOKEN` 环境变量
-///   - NODE_REPORT_TOKEN   blake3(NODE_TOKEN)，填给 mgr 的 `NODE_REPORT_TOKEN`
+///   - NODE_REPORT_TOKEN   填给 mgr 的 `NODE_REPORT_TOKEN`
+///     若设置了 `NODE_TOKEN_SALT`，则是 blake3::keyed_hash(blake3(salt), token)
+///     否则是普通的 blake3(token)
+///
+/// 注意：运行时 `NODE_TOKEN_SALT` 必须和本命令执行时一致，否则 hash 对不上。
 fn generate_token_and_exit() -> Result<()> {
+    // 从环境变量读盐（可选）
+    let salt = std::env::var("NODE_TOKEN_SALT")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let salt_ref = salt.as_deref();
+
     // 32 字节密码学随机数
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|e| anyhow!("getrandom failed: {}", e))?;
@@ -717,12 +756,16 @@ fn generate_token_and_exit() -> Result<()> {
         .map(|b| format!("{:02x}", b))
         .collect::<String>();
 
-    // blake3 hash，与运行时 hash_token() 完全一致
-    let hash = blake3::hash(token_plain.as_bytes()).to_string();
+    // hash：和运行时使用的算法完全一致
+    let hash = hash_token(&token_plain, salt_ref);
 
     // 只输出两行，不写日志，避免污染 stdout
     println!("NODE_TOKEN={}", token_plain);
     println!("NODE_REPORT_TOKEN={}", hash);
+
+    if salt_ref.is_some() {
+        eprintln!("note: hash computed with NODE_TOKEN_SALT (keyed blake3)");
+    }
     Ok(())
 }
 
@@ -787,7 +830,8 @@ async fn main() -> Result<()> {
             s3_enable: config.record_s3_enable,
             media_server_id: media_server_id.clone(),
             fallback_server_id: config.server_id.clone(),
-            node_token: config.node_token.clone(),
+            // 传 hash，不传明文
+            node_token_hash: hashed_node_token(&config).to_string(),
         });
 
         let app = record_hook::router(hook_state);
