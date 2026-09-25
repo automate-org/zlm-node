@@ -6,16 +6,21 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// 与 main.rs 里 MediaServerIdCache 保持同一类型
+pub type MediaServerIdCache = std::sync::Arc<tokio::sync::RwLock<Option<String>>>;
+
 #[derive(Clone)]
 pub struct HookState {
     pub mgr_base: String,
     pub internal_api_token: String,
     pub http_client: reqwest::Client,
     pub keep_on_failure: bool,
-    /// zlm-node 的 server_id（= ZLM 的 mediaServerId）
-    pub server_id: String,
     /// 是否启用 S3 上传（关闭时只上报 mgr，本地保留）
     pub s3_enable: bool,
+    /// 共享的 mediaServerId 缓存：hook body 未带时从这里读
+    pub media_server_id: MediaServerIdCache,
+    /// 可选兜底：缓存也为空时用它（来自 main 里 config.server_id）
+    pub fallback_server_id: Option<String>,
 }
 
 pub fn router(state: Arc<HookState>) -> Router {
@@ -40,6 +45,34 @@ async fn handle_record_mp4(
     Json(json!({"code": 0}))
 }
 
+/// 解析本次 hook 应该用的 server_id：
+/// 1) hook body 里的 mediaServerId（ZLM 正常一定会带）
+/// 2) 共享缓存里的 mediaServerId（zlm-node 从 ZLM getServerConfig 拿到的）
+/// 3) 配置里的 SERVER_ID（可选兜底）
+/// 全部为空 → 报错，让 ZLM 按 hook.retry 重试
+async fn resolve_hook_server_id(state: &HookState, body: &Value) -> Result<String> {
+    if let Some(id) = body["mediaServerId"].as_str().filter(|s| !s.is_empty()) {
+        return Ok(id.to_string());
+    }
+    warn!("[record] hook body missing mediaServerId, falling back");
+
+    if let Some(id) = state.media_server_id.read().await.clone() {
+        if !id.is_empty() {
+            warn!("[record] using cached mediaServerId = {}", id);
+            return Ok(id);
+        }
+    }
+
+    if let Some(fb) = &state.fallback_server_id {
+        if !fb.is_empty() {
+            warn!("[record] using configured SERVER_ID fallback = {}", fb);
+            return Ok(fb.clone());
+        }
+    }
+
+    anyhow::bail!("[record] mediaServerId unavailable (body / cache / fallback all empty)")
+}
+
 async fn do_upload_and_notify(state: Arc<HookState>, body: Value) -> Result<()> {
     let file_path = body["file_path"].as_str().unwrap_or("").to_string();
     let stream = body["stream"].as_str().unwrap_or("").to_string();
@@ -55,25 +88,46 @@ async fn do_upload_and_notify(state: Arc<HookState>, body: Value) -> Result<()> 
         anyhow::bail!("missing file_path or stream");
     }
 
+    // ⭐ 解析 server_id（= mediaServerId）
+    let server_id = resolve_hook_server_id(&state, &body).await?;
+
     let local_path = std::path::Path::new(&file_path);
+
+    // 把 ZLM 的数字时间戳转成 mgr 期望的格式
+    //   ZLM hook 的 start_time 是秒级 int
+    //   time_len 是秒数（float）
+    //   mgr 期望：start_time/end_time 是 "YYYY-MM-DD HH:MM:SS" 字符串
+    //            record_start_ms 是毫秒 i64
+    let start_ts = body["start_time"].as_i64().unwrap_or(0);
+    let time_len = body["time_len"].as_f64().unwrap_or(0.0);
+
+    // 注意：from_timestamp 是 UTC；如果 mgr 期望本地时间，需改成
+    //   chrono::Local.timestamp_opt(start_ts, 0).single()
+    let start_time_str = chrono::DateTime::from_timestamp(start_ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default();
+    let end_time_str = chrono::DateTime::from_timestamp(start_ts + time_len as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default();
 
     // ── 最终上报给 mgr 的字段 ──
     let mut final_play_url = String::new();
     let mut s3_uploaded = false;
     let mut local_relative_url = String::new(); // S3 关闭/失败时用
+    let mut channel_id: Option<String> = None;
 
     // ── 1. S3 上传（如果启用）──
     if state.s3_enable {
         if local_path.exists() {
             match upload_to_s3(&state, &stream, &app, &vhost, &file_path).await {
-                Ok(access_url) => {
+                Ok((access_url, cid)) => {
                     final_play_url = access_url.clone();
                     s3_uploaded = true;
+                    channel_id = Some(cid);
                     info!("[record] uploaded {} → {}", file_path, access_url);
                 }
                 Err(e) => {
                     error!("[record] S3 upload failed for {}: {:#}", file_path, e);
-                    // 上传失败：让 mgr 用本地 URL 拼
                     local_relative_url = relative_url.clone();
                     if !state.keep_on_failure {
                         let _ = tokio::fs::remove_file(local_path).await;
@@ -85,7 +139,6 @@ async fn do_upload_and_notify(state: Arc<HookState>, body: Value) -> Result<()> 
             local_relative_url = relative_url.clone();
         }
     } else {
-        // S3 关闭：本地保留，交给 mgr 拼 URL
         info!("[record] S3 disabled, keep local file: {}", file_path);
         local_relative_url = relative_url.clone();
     }
@@ -96,11 +149,22 @@ async fn do_upload_and_notify(state: Arc<HookState>, body: Value) -> Result<()> 
         p["play_url"] = json!(final_play_url);
         p["s3_uploaded"] = json!(s3_uploaded);
         p["relative_url"] = json!(local_relative_url);
-        p["node_id"] = json!(state.server_id); // = mediaServerId
+        // node_id = mediaServerId
+        p["node_id"] = json!(server_id);
+
+        // 覆盖/补齐 mgr 期望的字段
+        p["start_time"] = json!(start_time_str);
+        p["end_time"] = json!(end_time_str);
+        p["record_start_ms"] = json!(start_ts * 1000); // 秒 → 毫秒
+
+        if let Some(cid) = channel_id {
+            p["channel_id"] = json!(cid);
+        }
+
         p
     };
 
-    let url = format!("{}/internal/on-record-event", state.mgr_base);
+    let url = format!("{}/api/internal/on-record-event", state.mgr_base);
     let notify_ok = match state
         .http_client
         .post(&url)
@@ -131,7 +195,6 @@ async fn do_upload_and_notify(state: Arc<HookState>, body: Value) -> Result<()> 
         if let Err(e) = tokio::fs::remove_file(local_path).await {
             warn!("[record] remove local failed: {}", e);
         } else {
-            // 清空目录（非空会失败，忽略）
             if let Some(parent) = local_path.parent() {
                 let _ = tokio::fs::remove_dir(parent).await;
             }
@@ -147,13 +210,17 @@ async fn do_upload_and_notify(state: Arc<HookState>, body: Value) -> Result<()> 
 }
 
 /// 上传录像到 S3（流式，避免大文件占内存）
+///
+/// 返回 `(access_url, channel_id)`：
+///   - `access_url`：S3 对象的访问 URL（公网 / CDN）
+///   - `channel_id`：mgr 反查出的通道 ID
 async fn upload_to_s3(
     state: &HookState,
     stream: &str,
     app: &str,
     vhost: &str,
     file_path: &str,
-) -> Result<String> {
+) -> Result<(String, String)> {
     // ── 1. 向 mgr 要 presigned PUT URL ──
     let presign_url = format!("{}/api/internal/presign-record", state.mgr_base);
     let presign_resp: Value = state
@@ -189,6 +256,11 @@ async fn upload_to_s3(
         .ok_or_else(|| anyhow::anyhow!("no access_url"))?
         .to_string();
 
+    let channel_id = presign_resp["channel_id"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
     // ── 2. 流式 PUT 到 S3 ──
     let file = tokio::fs::File::open(file_path)
         .await
@@ -217,5 +289,5 @@ async fn upload_to_s3(
     }
 
     info!("[record] S3 PUT ok: {} bytes → {}", file_size, access_url);
-    Ok(access_url)
+    Ok((access_url, channel_id))
 }

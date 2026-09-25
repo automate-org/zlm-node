@@ -5,7 +5,7 @@ use rustls::pki_types::ServerName;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock};
 use tokio_rustls::TlsConnector;
 
 mod record_hook;
@@ -14,11 +14,18 @@ mod tunnel;
 // ---------- 外网 API 列表 ----------
 const API_URLS: &[&str] = &["https://ip.3322.net", "https://ip.automate.org.cn"];
 
+// ---------- 共享缓存类型 ----------
+/// mediaServerId 缓存：None = 未获取，Some = 已获取且永久缓存
+type MediaServerIdCache = Arc<RwLock<Option<String>>>;
+/// ZLM version 缓存：None = 未获取，Some = 已获取且永久缓存
+type VersionCache = Arc<RwLock<Option<String>>>;
+
 // ---------- 配置 ----------
 #[derive(Deserialize, Clone)]
 struct Config {
-    #[serde(default = "default_server_id")]
-    server_id: String,
+    /// 可选兜底 server_id：mediaServerId 拿不到时使用；拿到则忽略。
+    /// 未设置时（None），mediaServerId 未就绪阶段会跳过上报。
+    server_id: Option<String>,
 
     #[serde(default = "default_api_base")]
     api_base: String,
@@ -127,9 +134,6 @@ struct Config {
     record_s3_enable: bool,
 }
 
-fn default_server_id() -> String {
-    "1".into()
-}
 fn default_api_base() -> String {
     "http://127.0.0.1:9080".into()
 }
@@ -326,6 +330,26 @@ async fn get_zlm_version(client: &Client, config: &Config) -> String {
     }
 }
 
+/// 已缓存 → 直接返回；未缓存 → 请求一次；
+/// 只有拿到真实版本号才写入缓存，"offline" / "online (unknown version)" 不缓存。
+async fn get_or_fetch_version(
+    client: &Client,
+    config: &Config,
+    cache: &VersionCache,
+) -> Option<String> {
+    if let Some(v) = cache.read().await.clone() {
+        return Some(v);
+    }
+    let v = get_zlm_version(client, config).await;
+    if v != "offline" && v != "online (unknown version)" {
+        info!("ZLM version: {}", v);
+        *cache.write().await = Some(v.clone());
+        Some(v)
+    } else {
+        None
+    }
+}
+
 fn get_json_str(value: &serde_json::Value, key: &str) -> Option<String> {
     if let Some(v) = value.get(key).and_then(|v| v.as_str()) {
         return Some(v.to_string());
@@ -360,6 +384,47 @@ async fn get_zlm_media_server_id(client: &Client, config: &Config) -> Option<Str
         .map(String::from)
 }
 
+/// 已缓存 → 直接返回；未缓存 → 请求一次，成功则永久缓存。
+async fn get_or_fetch_media_server_id(
+    client: &Client,
+    config: &Config,
+    cache: &MediaServerIdCache,
+) -> Option<String> {
+    if let Some(id) = cache.read().await.clone() {
+        return Some(id);
+    }
+    match get_zlm_media_server_id(client, config).await {
+        Some(id) => {
+            info!("[init] detected ZLM mediaServerId = {}", id);
+            *cache.write().await = Some(id.clone());
+            Some(id)
+        }
+        None => None,
+    }
+}
+
+/// 解析本次上报要用的 server_id：
+/// 1) mediaServerId（优先，拿到即缓存）
+/// 2) 配置的 SERVER_ID（仅当 mediaServerId 拿不到，且用户显式配置了）
+/// 3) None → 调用方跳过本次上报
+async fn resolve_server_id(
+    client: &Client,
+    config: &Config,
+    cache: &MediaServerIdCache,
+) -> Option<String> {
+    if let Some(id) = get_or_fetch_media_server_id(client, config, cache).await {
+        return Some(id);
+    }
+    if let Some(fallback) = &config.server_id {
+        warn!(
+            "mediaServerId unavailable, using configured SERVER_ID={} as fallback",
+            fallback
+        );
+        return Some(fallback.clone());
+    }
+    None
+}
+
 // ---------- 更新 ZLM 的 rtc.externIP ----------
 async fn update_extern_ip(client: &Client, config: &Config, ip: &str) {
     let url = format!(
@@ -388,7 +453,8 @@ async fn update_extern_ip(client: &Client, config: &Config, ip: &str) {
 }
 
 // ---------- 设置 ZLM 的 on_record_mp4 hook ----------
-async fn set_record_hook(client: &Client, config: &Config) {
+/// 返回 true 表示真正设置成功（HTTP 200 且 ZLM 返回 code == 0）
+async fn set_record_hook(client: &Client, config: &Config) -> bool {
     let hook_url = {
         let port = config.hook_listen.rsplit(':').next().unwrap_or("3004");
         let host = config
@@ -414,17 +480,30 @@ async fn set_record_hook(client: &Client, config: &Config) {
 
     match client.post(&url).json(&body).send().await {
         Ok(resp) => {
-            if resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+
+            // ✅ 同时校验 HTTP 200 和 ZLM 的 code == 0
+            let code = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("code").and_then(|c| c.as_i64()));
+
+            if status.is_success() && code == Some(0) {
                 info!("[record-hook] set ZLM hook.on_record_mp4 = {}", hook_url);
+                true
             } else {
                 warn!(
-                    "[record-hook] failed to set hook, HTTP {}",
-                    resp.status().as_u16()
+                    "[record-hook] failed to set hook, HTTP {} code={:?} body={}",
+                    status.as_u16(),
+                    code,
+                    text
                 );
+                false
             }
         }
         Err(e) => {
             warn!("[record-hook] failed to set hook: {:?}", e);
+            false
         }
     }
 }
@@ -433,6 +512,7 @@ async fn set_record_hook(client: &Client, config: &Config) {
 async fn report_status(
     client: &Client,
     config: &Config,
+    server_id: &str,
     public_ip: &str,
     version: &str,
 ) -> Result<()> {
@@ -453,7 +533,7 @@ async fn report_status(
     let hashed_token = hash_token(&config.node_token);
 
     let payload = serde_json::json!({
-        "server_id": config.server_id,   // = mediaServerId（main 里已覆盖）
+        "server_id": server_id,
         "api_base": config.api_base,
         "secret": config.secret,
         "public_ip": public_ip,
@@ -483,11 +563,11 @@ fn build_tls_connector(config: &Config) -> Result<TlsConnector> {
     if let Some(ca) = &config.tunnel_ca_cert {
         let bytes = std::fs::read(ca)?;
         for c in rustls_pemfile::certs(&mut bytes.as_slice()) {
-            roots.add(c?)?; // ✅ 保留 c? —— 元素是 Result<CertificateDer>
+            roots.add(c?)?;
         }
     } else {
         for c in rustls_native_certs::load_native_certs()? {
-            roots.add(c)?; // ✅ 不加 ? —— 元素是裸 CertificateDer
+            roots.add(c)?;
         }
     }
 
@@ -495,7 +575,6 @@ fn build_tls_connector(config: &Config) -> Result<TlsConnector> {
     let mut client_config = match (&config.tunnel_client_cert, &config.tunnel_client_key) {
         (Some(cert), Some(key)) => {
             let cert_bytes = std::fs::read(cert)?;
-            // ✅ 保留 .collect::<Result<...>>()?
             let certs: Vec<_> =
                 rustls_pemfile::certs(&mut cert_bytes.as_slice()).collect::<Result<Vec<_>, _>>()?;
 
@@ -513,11 +592,15 @@ fn build_tls_connector(config: &Config) -> Result<TlsConnector> {
 
     Ok(TlsConnector::from(Arc::new(client_config)))
 }
-// ---------- 持续运行主循环 ----------
-async fn run_loop(client: &Client, config: &Config, shutdown: Arc<Notify>) {
-    let cached_version = get_zlm_version(client, config).await;
-    info!("ZLM version (cached): {}", cached_version);
 
+// ---------- 持续运行主循环 ----------
+async fn run_loop(
+    client: &Client,
+    config: &Config,
+    shutdown: Arc<Notify>,
+    media_server_id: MediaServerIdCache,
+    version: VersionCache,
+) {
     let report_interval = Duration::from_secs(config.report_interval_secs);
     let ip_refresh_interval = Duration::from_secs(config.ip_refresh_interval_secs);
 
@@ -533,28 +616,49 @@ async fn run_loop(client: &Client, config: &Config, shutdown: Arc<Notify>) {
                 info!("Shutdown signal received, exiting main loop.");
                 break;
             }
+
             _ = report_tick.tick() => {
-                if let Some(ip) = &cached_ip {
-                    if let Err(e) = report_status(client, config, ip, &cached_version).await {
-                        warn!("Periodic report failed: {:?}", e);
-                    } else {
-                        info!("Periodic report sent.");
+                // mediaServerId 优先，其次配置 SERVER_ID，都没有则跳过本次上报
+                let sid = match resolve_server_id(client, config, &media_server_id).await {
+                    Some(id) => id,
+                    None => {
+                        warn!("Skip report: mediaServerId not ready and no SERVER_ID fallback");
+                        continue;
                     }
-                } else {
+                };
+
+                let ver = get_or_fetch_version(client, config, &version)
+                    .await
+                    .unwrap_or_else(|| "offline".to_string());
+
+                if cached_ip.is_none() {
                     match get_public_ip(client, config, &mut url_index).await {
-                        Ok(ip) => {
-                            cached_ip = Some(ip.clone());
-                            if let Err(e) = report_status(client, config, &ip, &cached_version).await {
-                                warn!("Initial report failed: {:?}", e);
-                            } else {
-                                info!("Initial report sent.");
-                            }
+                        Ok(ip) => cached_ip = Some(ip),
+                        Err(e) => {
+                            warn!("Failed to get IP for initial report: {:?}", e);
+                            continue;
                         }
-                        Err(e) => warn!("Failed to get IP for initial report: {:?}", e),
                     }
                 }
+                let ip = cached_ip.as_ref().unwrap();
+
+                if let Err(e) = report_status(client, config, &sid, ip, &ver).await {
+                    warn!("Periodic report failed: {:?}", e);
+                } else {
+                    info!("Periodic report sent (server_id={}, version={}).", sid, ver);
+                }
             }
+
             _ = ip_refresh_tick.tick() => {
+                let sid = match resolve_server_id(client, config, &media_server_id).await {
+                    Some(id) => id,
+                    None => continue,
+                };
+
+                let ver = get_or_fetch_version(client, config, &version)
+                    .await
+                    .unwrap_or_else(|| "offline".to_string());
+
                 match get_public_ip(client, config, &mut url_index).await {
                     Ok(ip) => {
                         if cached_ip.as_ref() != Some(&ip) {
@@ -565,7 +669,9 @@ async fn run_loop(client: &Client, config: &Config, shutdown: Arc<Notify>) {
                                 update_extern_ip(client, config, &ip).await;
                             }
 
-                            if let Err(e) = report_status(client, config, &ip, &cached_version).await {
+                            if let Err(e) =
+                                report_status(client, config, &sid, &ip, &ver).await
+                            {
                                 warn!("Immediate report after IP change failed: {:?}", e);
                             } else {
                                 info!("Immediate report after IP change sent.");
@@ -587,7 +693,7 @@ async fn run_loop(client: &Client, config: &Config, shutdown: Arc<Notify>) {
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let mut config: Config =
+    let config: Config =
         envy::from_env().context("Failed to load configuration from environment")?;
 
     let client = Client::builder()
@@ -596,18 +702,30 @@ async fn main() -> Result<()> {
         .build()
         .context("Failed to build HTTP client")?;
 
-    // ⬇️ 启动时从 ZLM 拉 mediaServerId，用它覆盖 config.server_id
-    match get_zlm_media_server_id(&client, &config).await {
-        Some(id) => {
-            info!("[init] detected ZLM mediaServerId = {}", id);
-            config.server_id = id;
+    // ---------- 共享缓存 ----------
+    let media_server_id: MediaServerIdCache = Arc::new(RwLock::new(None));
+    let version: VersionCache = Arc::new(RwLock::new(None));
+
+    // 启动时各尝试一次（失败不阻塞，等 run_loop 里重试）
+    if get_or_fetch_media_server_id(&client, &config, &media_server_id)
+        .await
+        .is_none()
+    {
+        match &config.server_id {
+            Some(id) => warn!(
+                "[init] mediaServerId unavailable, will fallback to SERVER_ID={}",
+                id
+            ),
+            None => {
+                warn!("[init] mediaServerId unavailable, report will be skipped until ZLM ready")
+            }
         }
-        None => {
-            warn!(
-                "[init] failed to get mediaServerId from ZLM, using configured server_id = {}",
-                config.server_id
-            );
-        }
+    }
+    if get_or_fetch_version(&client, &config, &version)
+        .await
+        .is_none()
+    {
+        warn!("[init] ZLM version unavailable, will retry later");
     }
 
     let shutdown = Arc::new(Notify::new());
@@ -618,7 +736,7 @@ async fn main() -> Result<()> {
         shutdown_clone.notify_waiters();
     });
 
-    // ⬇️ 录像 hook server
+    // ---------- 录像 hook server ----------
     if config.record_hook_enable {
         if config.internal_api_token.is_empty() {
             return Err(anyhow!(
@@ -631,8 +749,11 @@ async fn main() -> Result<()> {
             internal_api_token: config.internal_api_token.clone(),
             http_client: client.clone(),
             keep_on_failure: config.record_keep_on_failure,
-            server_id: config.server_id.clone(), // = mediaServerId
             s3_enable: config.record_s3_enable,
+            // hook 优先用 body 里自带的 mediaServerId；
+            // body 没带时依次回退到共享缓存、再回退到 SERVER_ID。
+            media_server_id: media_server_id.clone(),
+            fallback_server_id: config.server_id.clone(),
         });
 
         let app = record_hook::router(hook_state);
@@ -657,29 +778,33 @@ async fn main() -> Result<()> {
         // 启动时立即设置 hook
         set_record_hook(&client, &config).await;
 
-        // 定期兜底：ZLM 重启后 hook 会丢
-        let sync_interval = Duration::from_secs(config.record_hook_sync_interval_secs.max(10));
+        // 定期兜底：ZLM 重启后 hook 会丢；失败指数退避，成功后回落到稳态
         let client_clone = client.clone();
         let config_clone = config.clone();
         let shutdown_clone = shutdown.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(sync_interval);
-            tick.tick().await; // 跳过第一次
+            let steady_delay =
+                Duration::from_secs(config_clone.record_hook_sync_interval_secs.max(10));
+            let mut delay = Duration::from_secs(2);
             loop {
                 tokio::select! {
                     _ = shutdown_clone.notified() => {
                         info!("[record-hook] sync loop exit");
                         break;
                     }
-                    _ = tick.tick() => {
-                        set_record_hook(&client_clone, &config_clone).await;
-                    }
+                    _ = tokio::time::sleep(delay) => {}
                 }
+                let ok = set_record_hook(&client_clone, &config_clone).await;
+                delay = if ok {
+                    steady_delay
+                } else {
+                    (delay * 2).min(Duration::from_secs(30))
+                };
             }
         });
     }
 
-    // TLS 隧道
+    // ---------- TLS 隧道 ----------
     if config.tunnel_enable {
         if config.tunnel_remote_addr.is_empty() {
             return Err(anyhow!(
@@ -728,7 +853,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    run_loop(&client, &config, shutdown).await;
+    run_loop(&client, &config, shutdown, media_server_id, version).await;
 
     Ok(())
 }
