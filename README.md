@@ -21,6 +21,7 @@
 - ✅ **流式上传大文件（内存恒定 ~64KB，不受录像大小影响）**
 - ✅ **hook 自动重设（ZLM 重启后自动恢复），设成功判断 `code == 0`**
 - ✅ **hook 请求体自带 `mediaServerId` 优先，本地缓存兜底**
+- ✅ **只用一个 `NODE_TOKEN` 即可调用 mgr 全部接口（含录像 hook 内部接口）**
 
 ---
 
@@ -78,7 +79,7 @@ NODE_REPORT_TOKEN=<64位hex blake3哈希>
 
 | 变量名 | 默认值 | 必填 | 说明 |
 |--------|--------|------|------|
-| NODE_TOKEN | 空 | 建议 | 节点鉴权令牌（**明文**，上报时内部自动 blake3 哈希，通过 `X-Node-Token` 头发送） |
+| NODE_TOKEN | 空 | 是 | 节点鉴权令牌（**明文**，上报时内部自动 blake3 哈希，通过 `X-Node-Token` 头发送） |
 | SERVER_ID | 无 | 否 | **可选兜底**节点 ID：仅当 `mediaServerId` 拉取失败时使用；未设置时未就绪阶段跳过上报 |
 | API_BASE | http://127.0.0.1:9080 | 否 | ZLM API 基础地址 |
 | SECRET | 无 | 是 | ZLM API 密钥，必须与 ZLM `config.ini` 的 `[api] secret` 一致 |
@@ -116,10 +117,11 @@ NODE_REPORT_TOKEN=<64位hex blake3哈希>
 | RECORD_HOOK_ENABLE | false | 是否启用录像 hook 服务 |
 | HOOK_LISTEN | 127.0.0.1:3004 | hook 服务监听地址（与 ZLM 同机，用 loopback 即可） |
 | MGR_BASE | http://127.0.0.1:3002 | mgr 的 base URL（不含路径），用于调用内部接口 |
-| INTERNAL_API_TOKEN | 空 | mgr 的内部通信令牌，**启用录像 hook 时必填**，为空会导致启动失败 |
 | RECORD_S3_ENABLE | false | 是否上传录像到 S3（关闭时只通知 mgr，本地保留） |
 | RECORD_KEEP_ON_FAILURE | true | S3 上传失败时是否保留本地文件 |
 | RECORD_HOOK_SYNC_INTERVAL_SECS | 60 | 定期兜底重设 ZLM hook 的间隔（秒），最小 10s |
+
+> 录像 hook 调用 mgr 的 `presign-record` / `on-record-event` 内部接口时，**用 `NODE_TOKEN` 认证**（`X-Node-Token` 头），无需单独配 `INTERNAL_API_TOKEN`。
 
 **hook 重试策略**：
 - 首次设 hook 失败后按 `2s → 4s → 8s → ... → 30s` 指数退避重试
@@ -176,7 +178,7 @@ zlm-node 立即返回 200
 后台：
   ① 调 mgr /api/internal/presign-record 拿 S3 presigned URL
   ② 流式 PUT 文件到 S3
-  ③ 通知 mgr /internal/on-record-event（带 S3 URL 或本地相对路径）
+  ③ 通知 mgr /api/internal/on-record-event（带 S3 URL 或本地相对路径）
   ↓
 mgr 写 DB + 处理客户回调
 ```
@@ -187,9 +189,9 @@ mgr 写 DB + 处理客户回调
 export RECORD_HOOK_ENABLE=true
 export HOOK_LISTEN=127.0.0.1:3004
 export MGR_BASE=http://mgr.internal:3002
-export INTERNAL_API_TOKEN=q123456778
 export RECORD_S3_ENABLE=true
 export RECORD_KEEP_ON_FAILURE=true
+export NODE_TOKEN=<--gen-token 生成的明文>
 ./zlm-node
 ```
 
@@ -224,7 +226,17 @@ export RECORD_S3_ENABLE=false
 
 ## 🔐 令牌与认证
 
-### zlm-node ↔ mgr 上报认证
+### zlm-node ↔ mgr 全接口认证
+
+zlm-node **只需要一个 `NODE_TOKEN`** 就能调用 mgr 的所有接口：
+
+| 接口 | 用途 |
+|------|------|
+| `POST /api/zlm/report-status` | 节点状态上报 |
+| `POST /api/internal/presign-record` | 拿 S3 上传 URL |
+| `POST /api/internal/on-record-event` | 通知录像落库 |
+
+**两端配置**：
 
 ```
 zlm-node 侧:  NODE_TOKEN          = 明文 token
@@ -255,14 +267,9 @@ echo -n "<明文>" | b3sum    # 应等于 mgr 的 hash
 
 > **常见坑**：两边都配同一个 hash → 双重 hash → 永远 401。**zlm-node 填明文，mgr 填 hash。**
 
-### zlm-node hook ↔ mgr 内部接口
+### `INTERNAL_API_TOKEN` 与 zlm-node 无关
 
-录像 hook 调用 mgr 的两个接口：
-
-- `POST /api/internal/presign-record`
-- `POST /api/internal/on-record-event`
-
-用 `X-Internal-Token` 头鉴权，值必须等于 mgr 的 `INTERNAL_API_TOKEN`。
+`INTERNAL_API_TOKEN` 是 **mgr ↔ sip** 之间的共享令牌，zlm-node 不再需要它，也不需要配置。
 
 ---
 
@@ -363,7 +370,6 @@ export NODE_TOKEN=<--gen-token 生成的明文>
 export RECORD_HOOK_ENABLE=true
 export HOOK_LISTEN=127.0.0.1:3004
 export MGR_BASE=http://mgr.internal:3002
-export INTERNAL_API_TOKEN=<与 mgr 一致>
 export RECORD_S3_ENABLE=true
 export RECORD_KEEP_ON_FAILURE=true
 
@@ -486,15 +492,15 @@ curl -X POST http://127.0.0.1:3004/hook/on_record_mp4 \
 - 手工配的 `SERVER_ID` 是**可选兜底**：只在 `mediaServerId` 未就绪时使用；拿到后立刻切换
 - **推荐不配 `SERVER_ID`**，让未就绪阶段直接跳过上报，避免 mgr 侧出现错误节点
 
-### 8. 为什么 `RECORD_HOOK_ENABLE=true` 时必须配 `INTERNAL_API_TOKEN`？
+### 8. zlm-node 需要配置 `INTERNAL_API_TOKEN` 吗？
 
-录像 hook 需要调用 mgr 的两个内部接口（`presign-record` 和 `on-record-event`），这两个接口用 `X-Internal-Token` 鉴权，token 必须与 mgr 的 `INTERNAL_API_TOKEN` 一致。
+**不需要。** zlm-node 只用一个 `NODE_TOKEN` 就能调用 mgr 的全部接口：
 
-**为空的后果**：zlm-node 启动时直接报错退出：
+- `/api/zlm/report-status`（状态上报）
+- `/api/internal/presign-record`（拿 S3 上传 URL）
+- `/api/internal/on-record-event`（通知录像落库）
 
-```
-Error: INTERNAL_API_TOKEN must be set when RECORD_HOOK_ENABLE=true
-```
+`INTERNAL_API_TOKEN` 是 **mgr ↔ sip** 之间共享的，zlm-node 不参与。
 
 ### 9. S3 上传失败会丢录像吗？
 
@@ -532,6 +538,20 @@ zlm-node 已经校验了 **HTTP 200 且 ZLM 返回 `code == 0`**，只有两者�
 说明 ZLM 拒绝了（通常是 `secret` 错）。检查 zlm-node 的 `SECRET` 和 ZLM `config.ini` 的 `[api] secret` 是否一致。
 
 **`changed == 0` 不是失败**——它只表示"值未变化"（比如重复设置同一个 hook），`code == 0` 才是成功标志。
+
+### 13. 多机部署时 `NODE_TOKEN` 能共用吗？
+
+**可以，但不推荐。**
+
+mgr 侧的 `NODE_REPORT_TOKEN` 目前是单值——所有 zlm-node 必须共用同一个 `NODE_TOKEN`，一台泄漏 = 全部沦陷。
+
+要支持"每台独立 token"，mgr 侧的 `NODE_REPORT_TOKEN` 需要改成逗号分隔的多值：
+
+```
+NODE_REPORT_TOKEN=hash1,hash2,hash3
+```
+
+对应 mgr 代码要把"直接比对"改成"遍历比对"。当前版本未实现。
 
 ---
 

@@ -120,9 +120,6 @@ struct Config {
     #[serde(default = "default_mgr_base")]
     mgr_base: String,
 
-    #[serde(default)]
-    internal_api_token: String,
-
     #[serde(default = "default_record_keep_on_failure")]
     record_keep_on_failure: bool,
 
@@ -367,7 +364,7 @@ async fn get_zlm_media_server_id(client: &Client, config: &Config) -> Option<Str
         "{}/index/api/getServerConfig?secret={}",
         config.api_base, config.secret
     );
-    log::info!("[mediaServerId] GET {}", url); // ← 看实际用的 secret
+    log::debug!("[mediaServerId] GET {}", url);
 
     let resp: serde_json::Value = client
         .get(&url)
@@ -379,7 +376,7 @@ async fn get_zlm_media_server_id(client: &Client, config: &Config) -> Option<Str
         .await
         .ok()?;
 
-    log::info!(
+    log::debug!(
         "[mediaServerId] resp code={:?} msg={:?}",
         resp["code"],
         resp["msg"]
@@ -391,7 +388,7 @@ async fn get_zlm_media_server_id(client: &Client, config: &Config) -> Option<Str
         .and_then(|d| d["general.mediaServerId"].as_str())
         .map(String::from);
 
-    log::info!("[mediaServerId] resolved = {:?}", id);
+    log::debug!("[mediaServerId] resolved = {:?}", id);
     id
 }
 
@@ -733,7 +730,7 @@ fn generate_token_and_exit() -> Result<()> {
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // ⬇️ 新增：--gen-token 生成 token 后立即退出
+    // ⬇️ --gen-token 生成 token 后立即退出
     if std::env::args().any(|a| a == "--gen-token") {
         return generate_token_and_exit();
     }
@@ -783,12 +780,6 @@ async fn main() -> Result<()> {
 
     // ---------- 录像 hook server ----------
     if config.record_hook_enable {
-        if config.internal_api_token.is_empty() {
-            return Err(anyhow!(
-                "INTERNAL_API_TOKEN must be set when RECORD_HOOK_ENABLE=true"
-            ));
-        }
-
         let hook_state = Arc::new(record_hook::HookState {
             mgr_base: config.mgr_base.clone(),
             http_client: client.clone(),
