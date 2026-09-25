@@ -14,10 +14,13 @@
 - ✅ 内置公共 IP 查询 API 作为后备，确保高可用
 - ✅ 支持 TLS 证书校验开关（自签名场景）
 - ✅ 低资源占用，适合嵌入式或家庭设备部署
-- ✅ **启动时自动从 ZLM 拉取 `mediaServerId` 作为节点标识**
+- ✅ **启动时自动从 ZLM 拉取 `mediaServerId` 作为节点标识，拿到后永久缓存**
+- ✅ **ZLM 版本自动获取并缓存（只在成功拿到时缓存，失败下次重试）**
+- ✅ **内置 `--gen-token` 子命令，一键生成上报明文与 blake3 哈希，安装脚本不再依赖 `b3sum`**
 - ✅ **录像 hook 服务：接收 ZLM 的 `on_record_mp4` 事件，上传 S3 并通知 mgr**
 - ✅ **流式上传大文件（内存恒定 ~64KB，不受录像大小影响）**
-- ✅ **hook 自动重设（ZLM 重启后自动恢复）**
+- ✅ **hook 自动重设（ZLM 重启后自动恢复），设成功判断 `code == 0`**
+- ✅ **hook 请求体自带 `mediaServerId` 优先，本地缓存兜底**
 
 ---
 
@@ -25,21 +28,41 @@
 
 ### cargo 安装
 
-```bash
+```
 cargo install zlm-node
 ```
 
 ### 编译
 
-```bash
+```
 cargo build --release
 ```
 
 编译完成后，可执行文件位于 `target/release/zlm-node`。
 
+### 生成上报令牌
+
+在部署 zlm-node 和 mgr 之前，用 zlm-node 自己生成一对令牌，避免手工 hash 出错：
+
+```
+./target/release/zlm-node --gen-token
+```
+
+输出：
+
+```
+NODE_TOKEN=<64位hex 明文>
+NODE_REPORT_TOKEN=<64位hex blake3哈希>
+```
+
+- **`NODE_TOKEN`** → 填到 zlm-node 的 `NODE_TOKEN` 环境变量
+- **`NODE_REPORT_TOKEN`** → 填到 mgr 的 `NODE_REPORT_TOKEN` 环境变量
+
+> ⚠️ 不要反过来填。zlm-node 会自己把 `NODE_TOKEN` 做 blake3 哈希，再作为 `X-Node-Token` 请求头发送；mgr 用 `NODE_REPORT_TOKEN` 直接比对。
+
 ### 运行
 
-```bash
+```
 ./target/release/zlm-node
 ```
 
@@ -53,27 +76,36 @@ cargo build --release
 
 ### 基础配置
 
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| NODE_TOKEN | 空 | 节点鉴权令牌（上报时通过 `X-Node-Token` 头发送 blake3 哈希） |
-| SERVER_ID | 1 | 节点 ID 兜底值（启动时会被 ZLM 的 `mediaServerId` 自动覆盖） |
-| API_BASE | http://127.0.0.1:9080 | ZLM API 基础地址 |
-| SECRET | 935v73f7-bb6b-4889-a715-d9eb2d1936aa | ZLM API 密钥 |
-| MGR_URL | http://127.0.0.1:3002/api/zlm/report-status | 管理端状态上报接口 |
-| CUSTOM_IP | 无 | 手动指定公网 IP（优先级最高） |
-| INTERFACE | 无 | 指定网卡名称，从该网卡获取 IPv4 地址 |
-| IP_ECHO_API | 无 | 自定义 IP 获取服务地址，优先级高于内置公共 API |
-| ZLM_HTTP_PORT | 9080 | ZLM HTTP 端口，用于拼接 `http_fmp4_base` |
-| USE_HTTPS | false | 是否使用 HTTPS 协议拼接 `http_fmp4_base` |
-| STATIC_BASE | 无 | 静态资源基地址，若不设置则与 `http_fmp4_base` 相同 |
-| HTTP_FMP4_BASE | 无 | HTTP-FMP4 播放基地址，支持占位符；不设置则自动生成 |
-| REPORT_INTERVAL_SECS | 30 | 上报间隔（秒） |
-| IP_REFRESH_INTERVAL_SECS | 5 | IP 刷新间隔（秒） |
-| TLS_ACCEPT_INVALID_CERTS | false | 是否接受无效 TLS 证书（自签名场景） |
-| ENABLE_RTC_EXTERN_IP_UPDATE | true | 是否自动更新 ZLM 的 `rtc.externIP` |
+| 变量名 | 默认值 | 必填 | 说明 |
+|--------|--------|------|------|
+| NODE_TOKEN | 空 | 建议 | 节点鉴权令牌（**明文**，上报时内部自动 blake3 哈希，通过 `X-Node-Token` 头发送） |
+| SERVER_ID | 无 | 否 | **可选兜底**节点 ID：仅当 `mediaServerId` 拉取失败时使用；未设置时未就绪阶段跳过上报 |
+| API_BASE | http://127.0.0.1:9080 | 否 | ZLM API 基础地址 |
+| SECRET | 无 | 是 | ZLM API 密钥，必须与 ZLM `config.ini` 的 `[api] secret` 一致 |
+| MGR_URL | http://127.0.0.1:3002/api/zlm/report-status | 否 | 管理端状态上报接口 |
+| CUSTOM_IP | 无 | 否 | 手动指定公网 IP（优先级最高） |
+| INTERFACE | 无 | 否 | 指定网卡名称，从该网卡获取 IPv4 地址 |
+| IP_ECHO_API | 无 | 否 | 自定义 IP 获取服务地址，优先级高于内置公共 API |
+| ZLM_HTTP_PORT | 9080 | 否 | ZLM HTTP 端口，用于拼接 `http_fmp4_base` |
+| USE_HTTPS | false | 否 | 是否使用 HTTPS 协议拼接 `http_fmp4_base` |
+| STATIC_BASE | 无 | 否 | 静态资源基地址，若不设置则与 `http_fmp4_base` 相同 |
+| HTTP_FMP4_BASE | 无 | 否 | HTTP-FMP4 播放基地址，支持占位符；不设置则自动生成 |
+| REPORT_INTERVAL_SECS | 30 | 否 | 上报间隔（秒） |
+| IP_REFRESH_INTERVAL_SECS | 5 | 否 | IP 刷新间隔（秒） |
+| TLS_ACCEPT_INVALID_CERTS | false | 否 | 是否接受无效 TLS 证书（自签名场景） |
+| ENABLE_RTC_EXTERN_IP_UPDATE | true | 否 | 是否自动更新 ZLM 的 `rtc.externIP` |
 
 > **IP 获取优先级**：
 > `CUSTOM_IP` > `INTERFACE` > `IP_ECHO_API` > 内置公共 API（`ip.3322.net`、`ip.automate.org.cn`）
+
+### 节点标识与上报行为
+
+- **`mediaServerId`**：启动时从 ZLM `getServerConfig` 拉取，**成功一次后永久缓存**，之后不再请求
+- **`version`**：从 ZLM `/index/api/version` 拉取，**只在拿到真实版本号时缓存**，`offline` / `unknown` 不缓存，下次上报时重试
+- **`SERVER_ID`**（可选兜底）：
+  - 未设置：`mediaServerId` 未就绪时跳过本次上报，等下一 tick 重试
+  - 已设置：`mediaServerId` 未就绪时暂用该值，拿到后自动切换为 `mediaServerId`
+  - **推荐不设置**，避免 mgr 侧短暂出现"错误节点"
 
 ### 录像 hook 服务（可选）
 
@@ -84,10 +116,14 @@ cargo build --release
 | RECORD_HOOK_ENABLE | false | 是否启用录像 hook 服务 |
 | HOOK_LISTEN | 127.0.0.1:3004 | hook 服务监听地址（与 ZLM 同机，用 loopback 即可） |
 | MGR_BASE | http://127.0.0.1:3002 | mgr 的 base URL（不含路径），用于调用内部接口 |
-| INTERNAL_API_TOKEN | 空 | mgr 的内部通信令牌，**启用录像 hook 时必填** |
+| INTERNAL_API_TOKEN | 空 | mgr 的内部通信令牌，**启用录像 hook 时必填**，为空会导致启动失败 |
 | RECORD_S3_ENABLE | false | 是否上传录像到 S3（关闭时只通知 mgr，本地保留） |
 | RECORD_KEEP_ON_FAILURE | true | S3 上传失败时是否保留本地文件 |
-| RECORD_HOOK_SYNC_INTERVAL_SECS | 60 | 定期兜底重设 ZLM hook 的间隔（秒） |
+| RECORD_HOOK_SYNC_INTERVAL_SECS | 60 | 定期兜底重设 ZLM hook 的间隔（秒），最小 10s |
+
+**hook 重试策略**：
+- 首次设 hook 失败后按 `2s → 4s → 8s → ... → 30s` 指数退避重试
+- 成功后回落到 `RECORD_HOOK_SYNC_INTERVAL_SECS` 稳态检查
 
 ---
 
@@ -100,7 +136,7 @@ cargo build --release
 
 **示例**：
 
-```bash
+```
 # 播放地址使用 eth1 网卡的 IP，而上报 IP 使用公网 IP
 export HTTP_FMP4_BASE="http://{interface:eth1}:9080/"
 
@@ -114,14 +150,21 @@ export HTTP_FMP4_BASE="https://{ip}:9443/live/"
 
 启用 `RECORD_HOOK_ENABLE=true` 后，zlm-node 会：
 
-1. **启动时**从 ZLM 拉取 `mediaServerId`，用它作为节点标识（避免手工配 `SERVER_ID` 出错）
+1. **启动时**从 ZLM 拉取 `mediaServerId`，用它作为节点标识
 2. **启动本地 HTTP 服务**（默认 `127.0.0.1:3004`），接收 ZLM 的 `on_record_mp4` hook
 3. **自动重设 ZLM 的 hook 地址**，让 ZLM 录完直接投递到 zlm-node
-4. **每 60 秒兜底重设**（防止 ZLM 重启后配置丢失）
+4. **指数退避兜底重设**（ZLM 慢启动或重启后自动补上）
 5. 收到 hook 后：
    - 立即返回 `200`（不阻塞 ZLM）
    - 后台：调 mgr 拿 presigned URL → 流式上传 S3 → 通知 mgr 落库
    - **S3 关闭时**：跳过上传，本地保留，仅通知 mgr
+
+### 节点标识获取优先级（hook 请求内）
+
+1. **hook 请求体自带的 `mediaServerId`**（ZLM 正常一定会带）
+2. 共享缓存（由启动时的 `getServerConfig` 或 hook body 填充）
+3. 配置的 `SERVER_ID`（可选兜底）
+4. 全空 → 返回错误，ZLM 按 `hook.retry` 重试
 
 ### 数据流
 
@@ -140,7 +183,7 @@ mgr 写 DB + 处理客户回调
 
 ### 启用示例
 
-```bash
+```
 export RECORD_HOOK_ENABLE=true
 export HOOK_LISTEN=127.0.0.1:3004
 export MGR_BASE=http://mgr.internal:3002
@@ -160,7 +203,7 @@ export RECORD_KEEP_ON_FAILURE=true
 
 ### 本地存储模式（关闭 S3）
 
-```bash
+```
 export RECORD_S3_ENABLE=false
 ```
 
@@ -176,6 +219,50 @@ export RECORD_S3_ENABLE=false
 - ZLM 录像 hook → zlm-node（本机 loopback）
 
 **两条独立路径，互不干扰。**
+
+---
+
+## 🔐 令牌与认证
+
+### zlm-node ↔ mgr 上报认证
+
+```
+zlm-node 侧:  NODE_TOKEN          = 明文 token
+              └─ 内部 blake3 哈希后作为 X-Node-Token 发送
+
+mgr 侧:       NODE_REPORT_TOKEN   = blake3(NODE_TOKEN) 的 hex
+              └─ 直接和请求头 X-Node-Token 比对
+```
+
+**生成方式**：
+
+```
+./zlm-node --gen-token
+```
+
+**校验两边一致**：
+
+```
+# 看 zlm-node 进程里的明文
+cat /proc/$(pgrep -f zlm-node)/environ | tr '\0' '\n' | grep '^NODE_TOKEN='
+
+# 看 mgr 进程里的 hash
+cat /proc/$(pgrep -f gbhub-mgr)/environ | tr '\0' '\n' | grep '^NODE_REPORT_TOKEN='
+
+# 手动算一遍验证
+echo -n "<明文>" | b3sum    # 应等于 mgr 的 hash
+```
+
+> **常见坑**：两边都配同一个 hash → 双重 hash → 永远 401。**zlm-node 填明文，mgr 填 hash。**
+
+### zlm-node hook ↔ mgr 内部接口
+
+录像 hook 调用 mgr 的两个接口：
+
+- `POST /api/internal/presign-record`
+- `POST /api/internal/on-record-event`
+
+用 `X-Internal-Token` 头鉴权，值必须等于 mgr 的 `INTERNAL_API_TOKEN`。
 
 ---
 
@@ -209,7 +296,7 @@ export RECORD_S3_ENABLE=false
 
 设置环境变量并启动 `zlm-node`：
 
-```bash
+```
 export TUNNEL_ENABLE=true
 export TUNNEL_LOCAL_ADDR=127.0.0.1:18080
 export TUNNEL_REMOTE_ADDR=tunnel.example.com:443
@@ -223,7 +310,7 @@ export TUNNEL_AUTH_TOKEN=my-secret-token
 
 编辑 ZLMediaKit 的 `config.ini`，将 `[hook]` 部分的**非录像 hook** 改为本地隧道地址：
 
-```ini
+```
 [hook]
 on_play=http://127.0.0.1:18080/hook/on_play
 on_publish=http://127.0.0.1:18080/hook/on_publish
@@ -239,13 +326,20 @@ on_rtsp_realm=http://127.0.0.1:18080/hook/on_rtsp_realm
 
 ## 🔧 配置示例
 
+### 最小配置（只上报，不启 hook）
+
+```
+export API_BASE=http://127.0.0.1:9080
+export SECRET=<你的 ZLM secret>
+export MGR_URL=http://mgr.example.com:3002/api/zlm/report-status
+export NODE_TOKEN=<--gen-token 生成的明文>
+./zlm-node
+```
+
 ### 家庭动态公网 IP 场景（推荐使用自建 IP 服务）
 
-假设您已在云服务器部署了 IP 身份服务（返回纯 IP 文本），地址为 `http://your-cloud-server:8080`。
-
-```bash
-export NODE_TOKEN=your_secret_token_here
-export SERVER_ID=home-node-01
+```
+export NODE_TOKEN=<--gen-token 生成的明文>
 export API_BASE=http://127.0.0.1:9080
 export SECRET=your_zlm_secret
 export MGR_URL=http://your-gbhub-domain/api/zlm/report-status
@@ -253,43 +347,43 @@ export IP_ECHO_API=http://your-cloud-server:8080
 export REPORT_INTERVAL_SECS=30
 export IP_REFRESH_INTERVAL_SECS=5
 export ENABLE_RTC_EXTERN_IP_UPDATE=true
-./target/release/zlm-node
+./zlm-node
 ```
 
 ### 完整部署（状态上报 + 录像 hook + S3 上传）
 
-```bash
+```
 # 状态上报
 export API_BASE=http://127.0.0.1:9080
 export SECRET=your_zlm_secret
 export MGR_URL=http://mgr.internal:3002/api/zlm/report-status
-export NODE_TOKEN=your_node_token
+export NODE_TOKEN=<--gen-token 生成的明文>
 
 # 录像 hook
 export RECORD_HOOK_ENABLE=true
 export HOOK_LISTEN=127.0.0.1:3004
 export MGR_BASE=http://mgr.internal:3002
-export INTERNAL_API_TOKEN=q123456778
+export INTERNAL_API_TOKEN=<与 mgr 一致>
 export RECORD_S3_ENABLE=true
 export RECORD_KEEP_ON_FAILURE=true
 
-./target/release/zlm-node
+./zlm-node
 ```
 
 ### 手动指定 IP（测试或固定 IP 场景）
 
-```bash
+```
 export CUSTOM_IP=203.0.113.5
 # 其他必需变量...
-./target/release/zlm-node
+./zlm-node
 ```
 
 ### 使用网卡 IP（多网卡环境）
 
-```bash
+```
 export INTERFACE=eth0
 # 其他变量...
-./target/release/zlm-node
+./zlm-node
 ```
 
 ---
@@ -300,9 +394,19 @@ export INTERFACE=eth0
 
 ```
 [init] detected ZLM mediaServerId = zlmediakit-abc123
-Public IP: 123.45.67.89, Version: master(abc123)
-Periodic report sent.
+ZLM version: master(a485d89)
+Periodic report sent (server_id=zlmediakit-abc123, version=master(a485d89)).
 ```
+
+**如果 ZLM 尚未启动**，会先看到：
+
+```
+[init] mediaServerId unavailable, report will be skipped until ZLM ready
+[init] ZLM version unavailable, will retry later
+Skip report: mediaServerId not ready and no SERVER_ID fallback
+```
+
+这属于正常现象——ZLM 起来后最多等一个 `REPORT_INTERVAL_SECS`（默认 30s）就会自动转为正常上报。
 
 2. 检查管理端是否收到节点状态更新。
 
@@ -315,9 +419,17 @@ Periodic report sent.
 [record-hook] set ZLM hook.on_record_mp4 = http://127.0.0.1:3004/hook/on_record_mp4
 ```
 
+**失败时**会看到：
+
+```
+[record-hook] failed to set hook, HTTP 200 code=Some(-1) body={"code":-1,"msg":"secret error"}
+```
+
+说明 ZLM 的 `[api] secret` 和 zlm-node 的 `SECRET` 不一致。
+
 5. **手工触发录像 hook 测试**：
 
-```bash
+```
 echo "test" > /tmp/test.mp4
 curl -X POST http://127.0.0.1:3004/hook/on_record_mp4 \
   -H "Content-Type: application/json" \
@@ -326,7 +438,10 @@ curl -X POST http://127.0.0.1:3004/hook/on_record_mp4 \
     "url": "record/test/test.mp4",
     "stream": "34020000001320000001_34020000001310000001",
     "app": "rtp",
-    "vhost": "__defaultVhost__"
+    "vhost": "__defaultVhost__",
+    "mediaServerId": "zlmediakit-abc123",
+    "start_time": 1699000000,
+    "time_len": 11.0
   }'
 ```
 
@@ -367,12 +482,19 @@ curl -X POST http://127.0.0.1:3004/hook/on_record_mp4 \
 ### 7. `mediaServerId` 和 `SERVER_ID` 是什么关系？
 
 - zlm-node 启动时**自动从 ZLM 拉 `mediaServerId`**，用它作为节点标识上报给 mgr
-- 手工配的 `SERVER_ID` 只作为拉取失败时的兜底
-- **好处**：避免手工配置出错；ZLM 重装后自动跟随新 ID
+- `mediaServerId` **拿到一次后永久缓存**，不再请求 ZLM
+- 手工配的 `SERVER_ID` 是**可选兜底**：只在 `mediaServerId` 未就绪时使用；拿到后立刻切换
+- **推荐不配 `SERVER_ID`**，让未就绪阶段直接跳过上报，避免 mgr 侧出现错误节点
 
 ### 8. 为什么 `RECORD_HOOK_ENABLE=true` 时必须配 `INTERNAL_API_TOKEN`？
 
 录像 hook 需要调用 mgr 的两个内部接口（`presign-record` 和 `on-record-event`），这两个接口用 `X-Internal-Token` 鉴权，token 必须与 mgr 的 `INTERNAL_API_TOKEN` 一致。
+
+**为空的后果**：zlm-node 启动时直接报错退出：
+
+```
+Error: INTERNAL_API_TOKEN must be set when RECORD_HOOK_ENABLE=true
+```
 
 ### 9. S3 上传失败会丢录像吗？
 
@@ -380,6 +502,36 @@ curl -X POST http://127.0.0.1:3004/hook/on_record_mp4 \
 - 排查 S3 / 网络问题
 - 手动或脚本重传
 - 临时关闭 S3（`RECORD_S3_ENABLE=false`）让 zlm-node 走本地模式
+
+### 10. `--gen-token` 和手工用 `b3sum` 有什么区别？
+
+`--gen-token` 内部直接调用 Rust 的 `blake3` crate 计算哈希，与运行时 `hash_token()` 使用的是**同一实现**，天然一致。手工用 `b3sum` 时容易踩 `echo -n` 缺换行、`\r` 混入、编码不一致等坑，导致两边算出的 hash 不同、永远 401。
+
+**推荐始终用 `--gen-token` 生成。**
+
+### 11. ZLM 慢启动时 zlm-node 会怎样？
+
+自动自愈，无需干预：
+
+| 组件 | 失败表现 | 自愈方式 | 最坏延迟 |
+|---|---|---|---|
+| hook 设置 | 首次 set 失败 | 指数退避 2s→4s→…→30s | ZLM 起来后 ≤30s |
+| `mediaServerId` | 未就绪 | 每次上报前重试 | 起来后 ≤`IP_REFRESH_INTERVAL_SECS`（5s） |
+| `version` | 未就绪 | 每次上报前重试 | 同上 |
+| 状态上报 | 跳过（未配 `SERVER_ID`） | ZLM 起来后自动开始 | 5~30s |
+| hook 回调处理 | 不依赖 zlm-node 状态 | 直接用 body 里的 `mediaServerId` | 无 |
+
+### 12. hook 设置"看起来成功但没生效"怎么办？
+
+zlm-node 已经校验了 **HTTP 200 且 ZLM 返回 `code == 0`**，只有两者都满足才算成功。如果日志显示：
+
+```
+[record-hook] failed to set hook, HTTP 200 code=Some(-1) body={"code":-1,"msg":"secret error"}
+```
+
+说明 ZLM 拒绝了（通常是 `secret` 错）。检查 zlm-node 的 `SECRET` 和 ZLM `config.ini` 的 `[api] secret` 是否一致。
+
+**`changed == 0` 不是失败**——它只表示"值未变化"（比如重复设置同一个 hook），`code == 0` 才是成功标志。
 
 ---
 

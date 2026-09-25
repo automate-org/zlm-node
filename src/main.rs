@@ -367,6 +367,8 @@ async fn get_zlm_media_server_id(client: &Client, config: &Config) -> Option<Str
         "{}/index/api/getServerConfig?secret={}",
         config.api_base, config.secret
     );
+    log::info!("[mediaServerId] GET {}", url); // ← 看实际用的 secret
+
     let resp: serde_json::Value = client
         .get(&url)
         .timeout(Duration::from_secs(3))
@@ -377,11 +379,20 @@ async fn get_zlm_media_server_id(client: &Client, config: &Config) -> Option<Str
         .await
         .ok()?;
 
-    resp["data"]
+    log::info!(
+        "[mediaServerId] resp code={:?} msg={:?}",
+        resp["code"],
+        resp["msg"]
+    );
+
+    let id = resp["data"]
         .as_array()
         .and_then(|arr| arr.first())
-        .and_then(|d| d["general"]["mediaServerId"].as_str())
-        .map(String::from)
+        .and_then(|d| d["general.mediaServerId"].as_str())
+        .map(String::from);
+
+    log::info!("[mediaServerId] resolved = {:?}", id);
+    id
 }
 
 /// 已缓存 → 直接返回；未缓存 → 请求一次，成功则永久缓存。
@@ -689,9 +700,43 @@ async fn run_loop(
     }
 }
 
+/// 生成随机 token，输出明文和 blake3 hash，然后退出。
+///
+/// 输出格式（供 shell 脚本解析）：
+///   NODE_TOKEN=<64位小写hex>
+///   NODE_REPORT_TOKEN=<64位小写hex>
+///
+/// 语义：
+///   - NODE_TOKEN          明文，填给 zlm-node 的 `NODE_TOKEN` 环境变量
+///   - NODE_REPORT_TOKEN   blake3(NODE_TOKEN)，填给 mgr 的 `NODE_REPORT_TOKEN`
+fn generate_token_and_exit() -> Result<()> {
+    // 32 字节密码学随机数
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow!("getrandom failed: {}", e))?;
+
+    // 转 hex 作为明文 token
+    let token_plain = bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+
+    // blake3 hash，与运行时 hash_token() 完全一致
+    let hash = blake3::hash(token_plain.as_bytes()).to_string();
+
+    // 只输出两行，不写日志，避免污染 stdout
+    println!("NODE_TOKEN={}", token_plain);
+    println!("NODE_REPORT_TOKEN={}", hash);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // ⬇️ 新增：--gen-token 生成 token 后立即退出
+    if std::env::args().any(|a| a == "--gen-token") {
+        return generate_token_and_exit();
+    }
 
     let config: Config =
         envy::from_env().context("Failed to load configuration from environment")?;
@@ -750,8 +795,6 @@ async fn main() -> Result<()> {
             http_client: client.clone(),
             keep_on_failure: config.record_keep_on_failure,
             s3_enable: config.record_s3_enable,
-            // hook 优先用 body 里自带的 mediaServerId；
-            // body 没带时依次回退到共享缓存、再回退到 SERVER_ID。
             media_server_id: media_server_id.clone(),
             fallback_server_id: config.server_id.clone(),
         });
