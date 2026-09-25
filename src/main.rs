@@ -791,12 +791,12 @@ async fn main() -> Result<()> {
 
         let hook_state = Arc::new(record_hook::HookState {
             mgr_base: config.mgr_base.clone(),
-            internal_api_token: config.internal_api_token.clone(),
             http_client: client.clone(),
             keep_on_failure: config.record_keep_on_failure,
             s3_enable: config.record_s3_enable,
             media_server_id: media_server_id.clone(),
             fallback_server_id: config.server_id.clone(),
+            node_token: config.node_token.clone(),
         });
 
         let app = record_hook::router(hook_state);
